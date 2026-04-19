@@ -1,0 +1,45 @@
+swarm_state_manager:
+  publish_hz: 50.0
+  input_timeout_sec: 0.5
+  world_origin_xyz: [0.0, 0.0, 0.0]
+
+  friend_odom_topics: ["/uav0/odom", "/uav1/odom", "/uav2/odom"]
+  enemy_odom_topics: ["/enemy0/odom", "/enemy1/odom", "/enemy2/odom"]
+  enemy_exists_topic: "/enemy_target_manager/enemy_exists"
+  enemy_frozen_topic: "/enemy_target_manager/enemy_frozen"
+
+  obs_k_friends: 2
+  obs_k_target: 3
+  obs_k_friend_targetpos: 3
+
+  fov_horizontal_deg: 60.0
+  fov_vertical_deg: 45.0
+  max_visible_distance: 6.0
+  hit_radius: 0.15
+
+  friendly_states_topic: "/swarm_state_manager/friendly_states"
+  target_states_topic: "/swarm_state_manager/target_states"
+  target_visibility_topic: "/swarm_state_manager/target_visibility"
+  policy_raw_obs_topic: "/swarm_state_manager/policy_raw_obs_all"
+  hit_flags_topic: "/swarm_state_manager/hit_flags"
+  friend_frozen_pub_topic: "/swarm_state_manager/friend_frozen"
+  hit_event_topics: ["/uav0/policy/hit_event", "/uav1/policy/hit_event", "/uav2/policy/hit_event"]
+  hit_enemy_index_topics: ["/uav0/policy/hit_enemy_index", "/uav1/policy/hit_enemy_index", "/uav2/policy/hit_enemy_index"]
+
+policy_control_node:
+  bundle_dir: "/home/wcw/interception_ws/src/rl_policy/policy"
+  device: "cpu"
+  output_hz: 50.0
+
+  policy_raw_obs_topic: "/swarm_state_manager/policy_raw_obs_all"
+  friendly_states_topic: "/swarm_state_manager/friendly_states"
+  hit_flags_topic: "/swarm_state_manager/hit_flags"
+
+  actions_normalized_topic: "/swarm/policy/actions_normalized"
+  actions_command_topic: "/swarm/policy/actions_command"
+  hover_flags_topic: "/swarm/policy/hover_flags"
+  valid_agent_mask_topic: "/swarm/policy/valid_agent_mask"
+  per_agent_command_topics: ["/uav0/policy/command", "/uav1/policy/command", "/uav2/policy/command"]
+
+  hover_accel_command: [0.0, 0.0, 0.0]
+  hover_yaw_rate_command: 0.0

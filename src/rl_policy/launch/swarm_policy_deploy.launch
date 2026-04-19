@@ -1,0 +1,28 @@
+<launch>
+  <arg name="use_python3_prefix" default="false"/>
+  <arg name="params_file" default="$(find rl_policy)/config/deployment_params.yaml"/>
+
+  <group if="$(arg use_python3_prefix)">
+    <node pkg="rl_policy" type="spwan_targets_node.py" name="enemy_target_manager" output="screen" launch-prefix="python3">
+      <rosparam command="load" file="$(arg params_file)" ns="enemy_target_manager"/>
+    </node>
+    <node pkg="rl_policy" type="swarm_state_manager.py" name="swarm_state_manager" output="screen" launch-prefix="python3">
+      <rosparam command="load" file="$(arg params_file)" ns="swarm_state_manager"/>
+    </node>
+    <node pkg="rl_policy" type="policy_control_node.py" name="policy_control_node" output="screen" launch-prefix="python3">
+      <rosparam command="load" file="$(arg params_file)" ns="policy_control_node"/>
+    </node>
+  </group>
+
+  <group unless="$(arg use_python3_prefix)">
+    <node pkg="rl_policy" type="spwan_targets_node.py" name="enemy_target_manager" output="screen">
+      <rosparam command="load" file="$(arg params_file)" ns="enemy_target_manager"/>
+    </node>
+    <node pkg="rl_policy" type="swarm_state_manager.py" name="swarm_state_manager" output="screen">
+      <rosparam command="load" file="$(arg params_file)" ns="swarm_state_manager"/>
+    </node>
+    <node pkg="rl_policy" type="policy_control_node.py" name="policy_control_node" output="screen">
+      <rosparam command="load" file="$(arg params_file)" ns="policy_control_node"/>
+    </node>
+  </group>
+</launch>

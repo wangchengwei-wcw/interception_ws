@@ -1,28 +1,21 @@
 <launch>
-  <arg name="use_python3_prefix" default="false"/>
+  <!--
+    Policy deployment only.
+    The enemy target generator is intentionally not started here because it
+    spawns one target formation and drives it toward the origin. In real
+    deployment there is no Isaac Lab-style environment reset, so start targets
+    explicitly when needed:
+
+      roslaunch rl_policy spawn_targets.launch
+  -->
   <arg name="params_file" default="$(find rl_policy)/config/deployment_params.yaml"/>
 
-  <group if="$(arg use_python3_prefix)">
-    <node pkg="rl_policy" type="spwan_targets_node.py" name="enemy_target_manager" output="screen" launch-prefix="python3">
-      <rosparam command="load" file="$(arg params_file)" ns="enemy_target_manager"/>
-    </node>
-    <node pkg="rl_policy" type="swarm_state_manager.py" name="swarm_state_manager" output="screen" launch-prefix="python3">
-      <rosparam command="load" file="$(arg params_file)" ns="swarm_state_manager"/>
-    </node>
-    <node pkg="rl_policy" type="policy_control_node.py" name="policy_control_node" output="screen" launch-prefix="python3">
-      <rosparam command="load" file="$(arg params_file)" ns="policy_control_node"/>
-    </node>
-  </group>
+  <rosparam command="load" file="$(arg params_file)"/>
 
-  <group unless="$(arg use_python3_prefix)">
-    <node pkg="rl_policy" type="spwan_targets_node.py" name="enemy_target_manager" output="screen">
-      <rosparam command="load" file="$(arg params_file)" ns="enemy_target_manager"/>
-    </node>
-    <node pkg="rl_policy" type="swarm_state_manager.py" name="swarm_state_manager" output="screen">
-      <rosparam command="load" file="$(arg params_file)" ns="swarm_state_manager"/>
-    </node>
-    <node pkg="rl_policy" type="policy_control_node.py" name="policy_control_node" output="screen">
-      <rosparam command="load" file="$(arg params_file)" ns="policy_control_node"/>
-    </node>
+  <group>
+    <node pkg="rl_policy" type="swarm_state_manager.py" name="swarm_state_manager" output="screen"/>
+    <!-- <node pkg="rl_policy" type="policy_control_node.py" name="policy_control_node" output="screen"/> -->
+    <!-- <node pkg="rl_policy" type="policy_cmd_bridge.py" name="policy_cmd_bridge" output="screen"/> -->
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find rl_policy)/launch/rviz.rviz" output="screen"/>
   </group>
 </launch>

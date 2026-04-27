@@ -10,7 +10,6 @@ This node:
    - translate mode: fly directly toward goal
    - force_field mode: goal attraction + pursuer repulsion + separation + cohesion
 5) can freeze targets when hit events are reported by friendly policy nodes
-6) can respawn targets on demand
 
 Designed to pair with the previously generated ROS1 policy / hit-detection nodes.
 
@@ -34,7 +33,7 @@ import numpy as np
 import rospy
 from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Int32, String, UInt8MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray, String, UInt8MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -111,22 +110,15 @@ class EnemyTargetManager:
         self.random_seed = int(rospy.get_param("~random_seed", 0))
         self.fixed_spawn_theta_deg = float(rospy.get_param("~fixed_spawn_theta_deg", -9999.0))
         self.freeze_when_reach_goal = bool(rospy.get_param("~freeze_when_reach_goal", False))
-        self.auto_respawn_when_all_inactive = bool(rospy.get_param("~auto_respawn_when_all_inactive", False))
-        self.auto_respawn_delay = float(rospy.get_param("~auto_respawn_delay", 1.0))
         self.terminate_on_goal_reach = bool(rospy.get_param("~terminate_on_goal_reach", True))
         self.stop_publish_after_terminate = bool(rospy.get_param("~stop_publish_after_terminate", True))
         self.clear_markers_on_terminate = bool(rospy.get_param("~clear_markers_on_terminate", True))
 
         # ---------------------------- hit sync ---------------------------
-        self.friend_frozen_topic = rospy.get_param("~friend_frozen_topic", "")
-        self.hit_topics = list(rospy.get_param("~hit_topics", []))
-        self.hit_enemy_index_topics = list(rospy.get_param("~hit_enemy_index_topics", []))
+        self.friendly_states_topic = rospy.get_param("~friendly_states_topic", "/swarm_state_manager/friendly_states")
+        self.hit_enemy_indices_topic = rospy.get_param("~hit_enemy_indices_topic", "/swarm_state_manager/hit_enemy_indices")
         self.freeze_enemy_on_hit = bool(rospy.get_param("~freeze_enemy_on_hit", True))
         self.keep_exists_true_when_hit = bool(rospy.get_param("~keep_exists_true_when_hit", True))
-
-        # -------------------------- reset control ------------------------
-        self.reset_topic = rospy.get_param("~reset_topic", "~reset")
-        self.respawn_topic = rospy.get_param("~respawn_topic", "~respawn")
 
         # -------------------------- visualization ------------------------
         self.publish_markers = bool(rospy.get_param("~publish_markers", True))
@@ -150,10 +142,7 @@ class EnemyTargetManager:
         self.friend_states: List[EntityState] = [EntityState() for _ in range(len(self.friend_odom_topics))]
         self.friend_frozen = np.zeros(len(self.friend_odom_topics), dtype=bool)
         self.enemies: List[EnemyState] = [EnemyState() for _ in range(self.enemy_size)]
-        self._last_hit_flags = [False] * len(self.hit_topics)
-        self._last_hit_enemy_idx = [-1] * len(self.hit_enemy_index_topics)
         self._last_time: Optional[rospy.Time] = None
-        self._last_all_inactive_time: Optional[rospy.Time] = None
         self._enemy_trails: List[List[np.ndarray]] = [[] for _ in range(self.enemy_size)]
         self._episode_terminated = False
         self._termination_reason = ""
@@ -174,20 +163,19 @@ class EnemyTargetManager:
         for i, topic in enumerate(self.friend_odom_topics):
             self.friend_subs.append(rospy.Subscriber(topic, Odometry, self._make_friend_cb(i), queue_size=1))
 
-        self.friend_frozen_sub = None
-        if self.friend_frozen_topic:
-            self.friend_frozen_sub = rospy.Subscriber(self.friend_frozen_topic, UInt8MultiArray, self._friend_frozen_cb, queue_size=1)
+        self.friendly_states_sub = rospy.Subscriber(
+            self.friendly_states_topic,
+            Float32MultiArray,
+            self._friendly_states_cb,
+            queue_size=1,
+        )
 
-        self.hit_subs = []
-        for i, topic in enumerate(self.hit_topics):
-            self.hit_subs.append(rospy.Subscriber(topic, Bool, self._make_hit_cb(i), queue_size=1))
-
-        self.hit_enemy_index_subs = []
-        for i, topic in enumerate(self.hit_enemy_index_topics):
-            self.hit_enemy_index_subs.append(rospy.Subscriber(topic, Int32, self._make_hit_enemy_idx_cb(i), queue_size=1))
-
-        self.reset_sub = rospy.Subscriber(self.reset_topic, Bool, self._reset_cb, queue_size=1)
-        self.respawn_sub = rospy.Subscriber(self.respawn_topic, Bool, self._respawn_cb, queue_size=1)
+        self.hit_enemy_indices_sub = rospy.Subscriber(
+            self.hit_enemy_indices_topic,
+            Int32MultiArray,
+            self._hit_enemy_indices_cb,
+            queue_size=1,
+        )
 
         # ---------------------------- startup ----------------------------
         if self.spawn_on_start:
@@ -222,34 +210,25 @@ class EnemyTargetManager:
             self.friend_states[idx] = self._odom_to_entity(msg)
         return _cb
 
-    def _make_hit_cb(self, idx: int):
-        def _cb(msg: Bool) -> None:
-            if msg.data and not self._last_hit_flags[idx]:
-                enemy_idx = self._resolve_hit_enemy_idx(idx)
-                if 0 <= enemy_idx < self.enemy_size:
-                    self._freeze_enemy(enemy_idx, reason=f"hit_topic[{idx}]")
-            self._last_hit_flags[idx] = bool(msg.data)
-        return _cb
+    def _hit_enemy_indices_cb(self, msg: Int32MultiArray) -> None:
+        if not self.freeze_enemy_on_hit:
+            return
+        for source_idx, enemy_idx in enumerate(msg.data):
+            enemy_idx = int(enemy_idx)
+            if 0 <= enemy_idx < self.enemy_size:
+                self._freeze_enemy(enemy_idx, reason=f"hit_enemy_indices[{source_idx}]")
 
-    def _make_hit_enemy_idx_cb(self, idx: int):
-        def _cb(msg: Int32) -> None:
-            self._last_hit_enemy_idx[idx] = int(msg.data)
-        return _cb
-
-    def _friend_frozen_cb(self, msg: UInt8MultiArray) -> None:
-        arr = np.asarray(msg.data, dtype=np.uint8)
+    def _friendly_states_cb(self, msg: Float32MultiArray) -> None:
+        arr = np.asarray(msg.data, dtype=np.float32)
+        if arr.size % 11 != 0:
+            rospy.logwarn_throttle(1.0, "friendly_states length %d is not divisible by 11", arr.size)
+            return
+        rows = arr.reshape((-1, 11))
         out = np.zeros(len(self.friend_states), dtype=bool)
-        n = min(out.size, arr.size)
-        out[:n] = arr[:n].astype(bool)
+        n = min(out.size, rows.shape[0])
+        # friendly_states columns: id, pos[3], vel[3], yaw, valid, frozen, hit
+        out[:n] = np.logical_or(rows[:n, 9] > 0.5, rows[:n, 10] > 0.5)
         self.friend_frozen = out
-
-    def _reset_cb(self, msg: Bool) -> None:
-        if msg.data:
-            self.reset_enemies()
-
-    def _respawn_cb(self, msg: Bool) -> None:
-        if msg.data:
-            self.spawn_enemies()
 
     # ------------------------------------------------------------------
     # message conversion
@@ -265,22 +244,8 @@ class EnemyTargetManager:
         return out
 
     # ------------------------------------------------------------------
-    # state / reset / spawn
+    # state / spawn
     # ------------------------------------------------------------------
-    def reset_enemies(self) -> None:
-        for i in range(self.enemy_size):
-            self.enemies[i] = EnemyState()
-            self._enemy_trails[i] = []
-        self._last_time = None
-        self._last_all_inactive_time = None
-        self._episode_terminated = False
-        self._termination_reason = ""
-        self._termination_stamp = None
-        self._markers_cleared_after_terminate = False
-        self.publish_enemy_masks(force=True)
-        self.publish_termination_status()
-        rospy.loginfo("Enemy target manager reset")
-
     def spawn_enemies(self) -> None:
         self._episode_terminated = False
         self._termination_reason = ""
@@ -314,7 +279,6 @@ class EnemyTargetManager:
             self.enemies[i].vel = v_step[i].copy()
 
         self._last_time = rospy.Time.now()
-        self._last_all_inactive_time = None
         self.publish_enemy_masks(force=True)
         self.publish_termination_status()
         rospy.loginfo("Spawned %d enemies with formation=%s, center_xy=(%.3f, %.3f), first_enemy=(%.3f, %.3f, %.3f)",
@@ -561,7 +525,6 @@ class EnemyTargetManager:
         if self._episode_terminated:
             return
         v_step = self.compute_enemy_velocity_step()
-        any_active = False
         any_reached_goal = False
 
         for i, enemy in enumerate(self.enemies):
@@ -570,21 +533,12 @@ class EnemyTargetManager:
                 continue
             enemy.vel = v_step[i].copy()
             enemy.pos = enemy.pos + enemy.vel * float(dt)
-            any_active = True
             self._append_trail(i, enemy.pos)
 
             if np.linalg.norm(enemy.pos[:2] - self.goal_xyz[:2]) <= self.enemy_goal_radius:
                 any_reached_goal = True
                 if self.freeze_when_reach_goal:
                     self._freeze_enemy(i, reason="reach_goal")
-
-        if not any_active:
-            if self._last_all_inactive_time is None:
-                self._last_all_inactive_time = rospy.Time.now()
-            elif self.auto_respawn_when_all_inactive and (rospy.Time.now() - self._last_all_inactive_time).to_sec() >= self.auto_respawn_delay:
-                self.spawn_enemies()
-        else:
-            self._last_all_inactive_time = None
 
         if any_reached_goal:
             if self.terminate_on_goal_reach:
@@ -600,17 +554,13 @@ class EnemyTargetManager:
         if len(trail) > self.trail_length:
             del trail[0:len(trail) - self.trail_length]
 
-    def _resolve_hit_enemy_idx(self, source_idx: int) -> int:
-        if source_idx < len(self._last_hit_enemy_idx):
-            return int(self._last_hit_enemy_idx[source_idx])
-        valid = [x for x in self._last_hit_enemy_idx if 0 <= x < self.enemy_size]
-        return valid[-1] if valid else -1
-
     def _freeze_enemy(self, enemy_idx: int, reason: str = "") -> None:
         if not (0 <= enemy_idx < self.enemy_size):
             return
         enemy = self.enemies[enemy_idx]
         if not enemy.exists:
+            return
+        if enemy.frozen:
             return
         enemy.frozen = True
         enemy.vel = np.zeros(3, dtype=np.float32)
@@ -653,6 +603,8 @@ class EnemyTargetManager:
 
     def publish_all_odometry(self, stamp: rospy.Time) -> None:
         for i, pub in enumerate(self.enemy_pubs):
+            if not self.enemies[i].exists or self.enemies[i].frozen:
+                continue
             pub.publish(self._build_enemy_odom(i, stamp))
 
     def _build_enemy_odom(self, enemy_idx: int, stamp: rospy.Time) -> Odometry:

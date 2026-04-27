@@ -1,231 +1,43 @@
 <launch>
-  <!-- =========================
-       Enemy target manager launch
-       formation_id mapping:
-         0 = random
-         1 = line2d
-         2 = circle2d
-         3 = v_wedge_2d
-         4 = rect2d
-         5 = echelon_2d
-         6 = random_disk
-       ========================= -->
+  <!--
+    Enemy target manager launch.
 
-  <!-- node control -->
+    Runtime parameters are loaded from:
+      $(find rl_policy)/config/deployment_params.yaml
+
+    The default node name is enemy_target_manager, matching the YAML section:
+      enemy_target_manager:
+        ...
+
+    formation_id mapping:
+      0 = random
+      1 = line2d
+      2 = circle2d
+      3 = v_wedge_2d
+      4 = rect2d
+      5 = echelon_2d
+      6 = random_disk
+  -->
+
+  <arg name="params_file" default="$(find rl_policy)/config/deployment_params.yaml"/>
   <arg name="node_name" default="enemy_target_manager"/>
   <arg name="use_python3_prefix" default="false"/>
   <arg name="output" default="screen"/>
 
-  <!-- basic -->
-  <arg name="frame_id" default="map"/>
-  <arg name="publish_rate" default="30.0"/>
-  <arg name="enemy_size" default="3"/>
+  <rosparam command="load" file="$(arg params_file)"/>
 
-  <!-- topics -->
-  <arg name="friend_odom_topics" default="['/uav0/odom', '/uav1/odom', '/uav2/odom']"/>
-  <arg name="enemy_odom_topics" default="['/enemy0/odom', '/enemy1/odom', '/enemy2/odom']"/>
-  <arg name="friend_frozen_topic" default=""/>
-  <arg name="hit_topics" default="['/uav0/policy/hit_event', '/uav1/policy/hit_event', '/uav2/policy/hit_event']"/>
-  <arg name="hit_enemy_index_topics" default="['/uav0/policy/hit_enemy_index', '/uav1/policy/hit_enemy_index', '/uav2/policy/hit_enemy_index']"/>
-  <arg name="reset_topic" default="~reset"/>
-  <arg name="respawn_topic" default="~respawn"/>
-
-  <!-- motion -->
-  <arg name="enemy_motion_mode" default="force_field"/>
-  <arg name="enemy_speed" default="2.3"/>
-  <arg name="enemy_goal_radius" default="0.10"/>
-  <arg name="goal_xyz" default="[0.0, 0.0, 1.0]"/>
-
-  <!-- force field params -->
-  <arg name="enemy_goal_attraction_weight" default="3.0"/>
-  <arg name="enemy_pursuer_repulsion_weight" default="1.5"/>
-  <arg name="enemy_pursuer_repulsion_range" default="40.0"/>
-  <arg name="enemy_pursuer_repulsion_smooth" default="1.0"/>
-  <arg name="enemy_pursuer_repulsion_max" default="2.0"/>
-  <arg name="enemy_separation_weight" default="0.2"/>
-  <arg name="enemy_separation_range" default="1.5"/>
-  <arg name="enemy_cohesion_weight" default="0.2"/>
-  <arg name="enemy_cohesion_range" default="5.0"/>
-  <arg name="enemy_evasive_eps" default="1e-6"/>
-
-  <!-- spawn / formation -->
-  <arg name="spawn_on_start" default="true"/>
-  <arg name="formation_id" default="6"/>
-  <arg name="formation_type" default="random"/>
-  <arg name="enemy_cluster_ring_radius" default="5.0"/>
-  <arg name="spawn_center_xy" default=""/>
-  <arg name="enemy_cluster_radius" default="1.0"/>
-  <arg name="enemy_height_min" default="1.0"/>
-  <arg name="enemy_height_max" default="1.0"/>
-  <arg name="enemy_min_separation_min" default="1.0"/>
-  <arg name="enemy_min_separation_max" default="2.0"/>
-  <arg name="random_seed" default="0"/>
-  <arg name="fixed_spawn_theta_deg" default="-9999.0"/>
-
-  <!-- terminate / respawn -->
-  <arg name="freeze_when_reach_goal" default="false"/>
-  <arg name="auto_respawn_when_all_inactive" default="false"/>
-  <arg name="auto_respawn_delay" default="1.0"/>
-  <arg name="terminate_on_goal_reach" default="true"/>
-  <arg name="stop_publish_after_terminate" default="true"/>
-  <arg name="clear_markers_on_terminate" default="true"/>
-
-  <!-- hit handling -->
-  <arg name="freeze_enemy_on_hit" default="true"/>
-  <arg name="keep_exists_true_when_hit" default="true"/>
-
-  <!-- visualization -->
-  <arg name="publish_markers" default="true"/>
-  <arg name="marker_topic" default="/enemy_targets/markers"/>
-  <arg name="enemy_marker_scale" default="0.25"/>
-  <arg name="goal_marker_scale" default="0.35"/>
-  <arg name="arrow_shaft_d" default="0.06"/>
-  <arg name="arrow_head_d" default="0.12"/>
-  <arg name="arrow_head_l" default="0.18"/>
-  <arg name="show_velocity_arrows" default="true"/>
-  <arg name="show_text" default="true"/>
-  <arg name="show_trails" default="false"/>
-  <arg name="trail_length" default="80"/>
-
-  <!-- If roslaunch cannot find python3 by itself, set use_python3_prefix:=true -->
   <group if="$(arg use_python3_prefix)">
     <node pkg="rl_policy"
           type="spwan_targets_node.py"
           name="$(arg node_name)"
           output="$(arg output)"
-          launch-prefix="python3">
-      <param name="frame_id" value="$(arg frame_id)"/>
-      <param name="publish_rate" value="$(arg publish_rate)"/>
-      <param name="enemy_size" value="$(arg enemy_size)"/>
-
-      <rosparam param="friend_odom_topics" subst_value="true">$(arg friend_odom_topics)</rosparam>
-      <rosparam param="enemy_odom_topics" subst_value="true">$(arg enemy_odom_topics)</rosparam>
-      <param name="friend_frozen_topic" value="$(arg friend_frozen_topic)"/>
-      <rosparam param="hit_topics" subst_value="true">$(arg hit_topics)</rosparam>
-      <rosparam param="hit_enemy_index_topics" subst_value="true">$(arg hit_enemy_index_topics)</rosparam>
-      <param name="reset_topic" value="$(arg reset_topic)"/>
-      <param name="respawn_topic" value="$(arg respawn_topic)"/>
-
-      <param name="enemy_motion_mode" value="$(arg enemy_motion_mode)"/>
-      <param name="enemy_speed" value="$(arg enemy_speed)"/>
-      <param name="enemy_goal_radius" value="$(arg enemy_goal_radius)"/>
-      <rosparam param="goal_xyz" subst_value="true">$(arg goal_xyz)</rosparam>
-
-      <param name="enemy_goal_attraction_weight" value="$(arg enemy_goal_attraction_weight)"/>
-      <param name="enemy_pursuer_repulsion_weight" value="$(arg enemy_pursuer_repulsion_weight)"/>
-      <param name="enemy_pursuer_repulsion_range" value="$(arg enemy_pursuer_repulsion_range)"/>
-      <param name="enemy_pursuer_repulsion_smooth" value="$(arg enemy_pursuer_repulsion_smooth)"/>
-      <param name="enemy_pursuer_repulsion_max" value="$(arg enemy_pursuer_repulsion_max)"/>
-      <param name="enemy_separation_weight" value="$(arg enemy_separation_weight)"/>
-      <param name="enemy_separation_range" value="$(arg enemy_separation_range)"/>
-      <param name="enemy_cohesion_weight" value="$(arg enemy_cohesion_weight)"/>
-      <param name="enemy_cohesion_range" value="$(arg enemy_cohesion_range)"/>
-      <param name="enemy_evasive_eps" value="$(arg enemy_evasive_eps)"/>
-
-      <param name="spawn_on_start" value="$(arg spawn_on_start)"/>
-      <param name="formation_id" value="$(arg formation_id)"/>
-      <param name="formation_type" value="$(arg formation_type)"/>
-      <param name="enemy_cluster_ring_radius" value="$(arg enemy_cluster_ring_radius)"/>
-      <param name="enemy_cluster_radius" value="$(arg enemy_cluster_radius)"/>
-      <param name="enemy_height_min" value="$(arg enemy_height_min)"/>
-      <param name="enemy_height_max" value="$(arg enemy_height_max)"/>
-      <param name="enemy_min_separation_min" value="$(arg enemy_min_separation_min)"/>
-      <param name="enemy_min_separation_max" value="$(arg enemy_min_separation_max)"/>
-      <param name="random_seed" value="$(arg random_seed)"/>
-      <param name="fixed_spawn_theta_deg" value="$(arg fixed_spawn_theta_deg)"/>
-      <param name="freeze_when_reach_goal" value="$(arg freeze_when_reach_goal)"/>
-      <param name="auto_respawn_when_all_inactive" value="$(arg auto_respawn_when_all_inactive)"/>
-      <param name="auto_respawn_delay" value="$(arg auto_respawn_delay)"/>
-      <param name="terminate_on_goal_reach" value="$(arg terminate_on_goal_reach)"/>
-      <param name="stop_publish_after_terminate" value="$(arg stop_publish_after_terminate)"/>
-      <param name="clear_markers_on_terminate" value="$(arg clear_markers_on_terminate)"/>
-      <param name="freeze_enemy_on_hit" value="$(arg freeze_enemy_on_hit)"/>
-      <param name="keep_exists_true_when_hit" value="$(arg keep_exists_true_when_hit)"/>
-
-      <param name="publish_markers" value="$(arg publish_markers)"/>
-      <param name="marker_topic" value="$(arg marker_topic)"/>
-      <param name="enemy_marker_scale" value="$(arg enemy_marker_scale)"/>
-      <param name="goal_marker_scale" value="$(arg goal_marker_scale)"/>
-      <param name="arrow_shaft_d" value="$(arg arrow_shaft_d)"/>
-      <param name="arrow_head_d" value="$(arg arrow_head_d)"/>
-      <param name="arrow_head_l" value="$(arg arrow_head_l)"/>
-      <param name="show_velocity_arrows" value="$(arg show_velocity_arrows)"/>
-      <param name="show_text" value="$(arg show_text)"/>
-      <param name="show_trails" value="$(arg show_trails)"/>
-      <param name="trail_length" value="$(arg trail_length)"/>
-
-      <!-- Optional explicit spawn center. Leave empty to use ring spawn. -->
-      <rosparam if="$(eval arg('spawn_center_xy') != '')" param="spawn_center_xy" subst_value="true">$(arg spawn_center_xy)</rosparam>
-    </node>
+          launch-prefix="python3"/>
   </group>
 
   <group unless="$(arg use_python3_prefix)">
     <node pkg="rl_policy"
           type="spwan_targets_node.py"
           name="$(arg node_name)"
-          output="$(arg output)">
-      <param name="frame_id" value="$(arg frame_id)"/>
-      <param name="publish_rate" value="$(arg publish_rate)"/>
-      <param name="enemy_size" value="$(arg enemy_size)"/>
-
-      <rosparam param="friend_odom_topics" subst_value="true">$(arg friend_odom_topics)</rosparam>
-      <rosparam param="enemy_odom_topics" subst_value="true">$(arg enemy_odom_topics)</rosparam>
-      <param name="friend_frozen_topic" value="$(arg friend_frozen_topic)"/>
-      <rosparam param="hit_topics" subst_value="true">$(arg hit_topics)</rosparam>
-      <rosparam param="hit_enemy_index_topics" subst_value="true">$(arg hit_enemy_index_topics)</rosparam>
-      <param name="reset_topic" value="$(arg reset_topic)"/>
-      <param name="respawn_topic" value="$(arg respawn_topic)"/>
-
-      <param name="enemy_motion_mode" value="$(arg enemy_motion_mode)"/>
-      <param name="enemy_speed" value="$(arg enemy_speed)"/>
-      <param name="enemy_goal_radius" value="$(arg enemy_goal_radius)"/>
-      <rosparam param="goal_xyz" subst_value="true">$(arg goal_xyz)</rosparam>
-
-      <param name="enemy_goal_attraction_weight" value="$(arg enemy_goal_attraction_weight)"/>
-      <param name="enemy_pursuer_repulsion_weight" value="$(arg enemy_pursuer_repulsion_weight)"/>
-      <param name="enemy_pursuer_repulsion_range" value="$(arg enemy_pursuer_repulsion_range)"/>
-      <param name="enemy_pursuer_repulsion_smooth" value="$(arg enemy_pursuer_repulsion_smooth)"/>
-      <param name="enemy_pursuer_repulsion_max" value="$(arg enemy_pursuer_repulsion_max)"/>
-      <param name="enemy_separation_weight" value="$(arg enemy_separation_weight)"/>
-      <param name="enemy_separation_range" value="$(arg enemy_separation_range)"/>
-      <param name="enemy_cohesion_weight" value="$(arg enemy_cohesion_weight)"/>
-      <param name="enemy_cohesion_range" value="$(arg enemy_cohesion_range)"/>
-      <param name="enemy_evasive_eps" value="$(arg enemy_evasive_eps)"/>
-
-      <param name="spawn_on_start" value="$(arg spawn_on_start)"/>
-      <param name="formation_id" value="$(arg formation_id)"/>
-      <param name="formation_type" value="$(arg formation_type)"/>
-      <param name="enemy_cluster_ring_radius" value="$(arg enemy_cluster_ring_radius)"/>
-      <param name="enemy_cluster_radius" value="$(arg enemy_cluster_radius)"/>
-      <param name="enemy_height_min" value="$(arg enemy_height_min)"/>
-      <param name="enemy_height_max" value="$(arg enemy_height_max)"/>
-      <param name="enemy_min_separation_min" value="$(arg enemy_min_separation_min)"/>
-      <param name="enemy_min_separation_max" value="$(arg enemy_min_separation_max)"/>
-      <param name="random_seed" value="$(arg random_seed)"/>
-      <param name="fixed_spawn_theta_deg" value="$(arg fixed_spawn_theta_deg)"/>
-      <param name="freeze_when_reach_goal" value="$(arg freeze_when_reach_goal)"/>
-      <param name="auto_respawn_when_all_inactive" value="$(arg auto_respawn_when_all_inactive)"/>
-      <param name="auto_respawn_delay" value="$(arg auto_respawn_delay)"/>
-      <param name="terminate_on_goal_reach" value="$(arg terminate_on_goal_reach)"/>
-      <param name="stop_publish_after_terminate" value="$(arg stop_publish_after_terminate)"/>
-      <param name="clear_markers_on_terminate" value="$(arg clear_markers_on_terminate)"/>
-      <param name="freeze_enemy_on_hit" value="$(arg freeze_enemy_on_hit)"/>
-      <param name="keep_exists_true_when_hit" value="$(arg keep_exists_true_when_hit)"/>
-
-      <param name="publish_markers" value="$(arg publish_markers)"/>
-      <param name="marker_topic" value="$(arg marker_topic)"/>
-      <param name="enemy_marker_scale" value="$(arg enemy_marker_scale)"/>
-      <param name="goal_marker_scale" value="$(arg goal_marker_scale)"/>
-      <param name="arrow_shaft_d" value="$(arg arrow_shaft_d)"/>
-      <param name="arrow_head_d" value="$(arg arrow_head_d)"/>
-      <param name="arrow_head_l" value="$(arg arrow_head_l)"/>
-      <param name="show_velocity_arrows" value="$(arg show_velocity_arrows)"/>
-      <param name="show_text" value="$(arg show_text)"/>
-      <param name="show_trails" value="$(arg show_trails)"/>
-      <param name="trail_length" value="$(arg trail_length)"/>
-
-      <!-- Optional explicit spawn center. Leave empty to use ring spawn. -->
-      <rosparam if="$(eval arg('spawn_center_xy') != '')" param="spawn_center_xy" subst_value="true">$(arg spawn_center_xy)</rosparam>
-    </node>
+          output="$(arg output)"/>
   </group>
 </launch>

@@ -165,6 +165,7 @@ catkin_install_python(PROGRAMS
   src/spwan_targets_node.py
   src/swarm_state_manager.py
   src/policy_control_node.py
+  src/policy_cmd_bridge.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

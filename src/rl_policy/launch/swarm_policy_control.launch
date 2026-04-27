@@ -1,0 +1,8 @@
+<launch>
+  <arg name="params_file" default="$(find rl_policy)/config/deployment_params.yaml"/>
+
+  <rosparam command="load" file="$(arg params_file)"/>
+
+  <node pkg="rl_policy" type="policy_control_node.py" name="policy_control_node" output="screen"/>
+  <node pkg="rl_policy" type="policy_cmd_bridge.py" name="policy_cmd_bridge" output="screen"/>
+</launch>

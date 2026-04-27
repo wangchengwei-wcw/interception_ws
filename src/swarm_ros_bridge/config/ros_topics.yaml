@@ -7,9 +7,9 @@
 
 ### list all <IPname: IP> here (IPname can be set arbitrarily) ###
 IP:
-  self: '*'   # '*' stands for all self IPs
-  robot1: 192.168.1.101
-  robot2: 192.168.1.102
+  self: '192.168.11.106'   # '*' stands for all self IPs
+  robot1: 192.168.11.106
+  robot2: 192.168.11.199
   test_local: 127.0.0.1 # just for local machine test
 
 ####### Send these ROS messages to remote robots #######
@@ -33,6 +33,11 @@ send_topics:
   srcIP: self # self IP
   srcPort: 3003 # ports of send_topics should be different
 
+- topic_name: /uav0/position_cmd # send the messages of this ROS topic
+  msg_type: quadrotor_msgs/PositionCommand # ROS message type (rosmsg style)
+  max_freq: 50 # max sending frequency (Hz) int
+  srcIP: self # self IP
+  srcPort: 3004 # ports of send_topics should be different
 
 ####### receive these ROS messages from remote robots #######
 ## if no recv_topics needed, comment all these out
@@ -51,3 +56,8 @@ recv_topics:
   msg_type: std_msgs/String # ROS message type (rosmsg style)
   srcIP: test_local # message source IPname
   srcPort: 3003 # message source port
+
+- topic_name: /uav0/odom # the received messages will be published in this topic
+  msg_type: nav_msgs/Odometry # ROS message type (rosmsg style)
+  srcIP: robot2 # message source IPname
+  srcPort: 3004 # message source port

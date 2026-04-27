@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 用途:
-在训练机上复刻 Isaac Lab + skrl 的真实推理链路，导出共享参数 IPPO 的 eager 部署 bundle。
+在训练机上复刻 Isaac Lab + skrl 的真实推理链路，导出共享参数 IPPO 的 eager 部署 bundle。如果是不同目标数量需要修改掉env中的设置
 
 导出内容:
 - policy_model_state.pt

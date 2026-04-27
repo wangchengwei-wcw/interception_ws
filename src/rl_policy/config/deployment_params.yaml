@@ -1,16 +1,18 @@
 swarm_state_manager:
   publish_hz: 50.0
   input_timeout_sec: 0.5
+  target_wait_log_period_sec: 3.0
+  observation_status_log_period_sec: 3.0
   world_origin_xyz: [0.0, 0.0, 0.0]
 
-  friend_odom_topics: ["/uav0/odom", "/uav1/odom", "/uav2/odom"]
-  enemy_odom_topics: ["/enemy0/odom", "/enemy1/odom", "/enemy2/odom"]
+  friend_odom_topics: ["/uav0/odom"]
+  enemy_odom_topics: ["/enemy0/odom"]
   enemy_exists_topic: "/enemy_target_manager/enemy_exists"
   enemy_frozen_topic: "/enemy_target_manager/enemy_frozen"
 
-  obs_k_friends: 2
-  obs_k_target: 3
-  obs_k_friend_targetpos: 3
+  obs_k_friends: 1
+  obs_k_target: 1
+  obs_k_friend_targetpos: 1
 
   fov_horizontal_deg: 60.0
   fov_vertical_deg: 45.0
@@ -21,25 +23,97 @@ swarm_state_manager:
   target_states_topic: "/swarm_state_manager/target_states"
   target_visibility_topic: "/swarm_state_manager/target_visibility"
   policy_raw_obs_topic: "/swarm_state_manager/policy_raw_obs_all"
-  hit_flags_topic: "/swarm_state_manager/hit_flags"
-  friend_frozen_pub_topic: "/swarm_state_manager/friend_frozen"
-  hit_event_topics: ["/uav0/policy/hit_event", "/uav1/policy/hit_event", "/uav2/policy/hit_event"]
-  hit_enemy_index_topics: ["/uav0/policy/hit_enemy_index", "/uav1/policy/hit_enemy_index", "/uav2/policy/hit_enemy_index"]
+  hit_enemy_indices_topic: "/swarm_state_manager/hit_enemy_indices"
 
 policy_control_node:
   bundle_dir: "/home/wcw/interception_ws/src/rl_policy/policy"
   device: "cpu"
   output_hz: 50.0
+  policy_status_log_period_sec: 3.0
 
   policy_raw_obs_topic: "/swarm_state_manager/policy_raw_obs_all"
   friendly_states_topic: "/swarm_state_manager/friendly_states"
-  hit_flags_topic: "/swarm_state_manager/hit_flags"
 
-  actions_normalized_topic: "/swarm/policy/actions_normalized"
-  actions_command_topic: "/swarm/policy/actions_command"
-  hover_flags_topic: "/swarm/policy/hover_flags"
-  valid_agent_mask_topic: "/swarm/policy/valid_agent_mask"
-  per_agent_command_topics: ["/uav0/policy/command", "/uav1/policy/command", "/uav2/policy/command"]
+  per_agent_command_topics: ["/uav0/policy/command"]
+  per_agent_command_stamped_topics: ["/uav0/policy/command_stamped"]
 
   hover_accel_command: [0.0, 0.0, 0.0]
   hover_yaw_rate_command: 0.0
+
+policy_cmd_bridge:
+  bundle_dir: "/home/wcw/interception_ws/src/rl_policy/policy"
+  num_agents: 1
+  policy_command_topics: ["/uav0/policy/command"]
+  odom_topics: ["/uav0/odom"]
+  px4_command_topics: ["/uav0/position_cmd"]
+  hit_enemy_indices_topic: "/swarm_state_manager/hit_enemy_indices"
+  publish_hz: 50.0
+  command_frame_id: "world"
+  hover_mode: "explicit"  # "implicit" = stop publishing on hit (px4ctrl timeout hover), "explicit" = hold position
+  jerk_mode: "zero"  # Training kept j_desired=0. Optional: "finite_difference" = d(accel_cmd)/dt
+  jerk_limit: 0.0  # m/s^3, 0 disables clipping
+  kx: [0.0, 0.0, 0.0] # seem to be useless
+  kv: [0.0, 0.0, 0.0] # seem to be useless
+  policy_cmd_timeout_sec: 0.3
+  no_policy_behavior: "stop"   # "hover" or "stop"
+
+enemy_target_manager:
+  frame_id: "world"
+  publish_rate: 50.0
+  enemy_size: 1
+
+  friend_odom_topics: ["/uav0/odom"]
+  enemy_odom_topics: ["/enemy0/odom"]
+  friendly_states_topic: "/swarm_state_manager/friendly_states"
+  hit_enemy_indices_topic: "/swarm_state_manager/hit_enemy_indices"
+
+  enemy_motion_mode: "force_field"
+  enemy_speed: 1.0
+  enemy_goal_radius: 0.10
+  goal_xyz: [0.0, 0.0, 1.0]
+
+  enemy_goal_attraction_weight: 3.0
+  enemy_pursuer_repulsion_weight: 1.5
+  enemy_pursuer_repulsion_range: 40.0
+  enemy_pursuer_repulsion_smooth: 1.0
+  enemy_pursuer_repulsion_max: 2.0
+  enemy_separation_weight: 0.2
+  enemy_separation_range: 1.5
+  enemy_cohesion_weight: 0.2
+  enemy_cohesion_range: 5.0
+  enemy_evasive_eps: 1.0e-6
+
+  spawn_on_start: true
+  formation_id: 6
+  formation_type: "random"
+  enemy_cluster_ring_radius: 5.0
+  # Optional explicit spawn center. Uncomment to override ring spawn.
+  # spawn_center_xy: [5.0, 0.0]
+  enemy_cluster_radius: 1.0
+  enemy_height_min: 1.0
+  enemy_height_max: 1.0
+  enemy_min_separation_min: 1.0
+  enemy_min_separation_max: 2.0
+  random_seed: 0
+  # fixed_spawn_theta_deg: -9999.0
+  fixed_spawn_theta_deg: 0.0
+
+  freeze_when_reach_goal: false
+  terminate_on_goal_reach: true
+  stop_publish_after_terminate: true
+  clear_markers_on_terminate: true
+
+  freeze_enemy_on_hit: true
+  keep_exists_true_when_hit: true
+
+  publish_markers: true
+  marker_topic: "/enemy_targets/markers"
+  enemy_marker_scale: 0.25
+  goal_marker_scale: 0.35
+  arrow_shaft_d: 0.06
+  arrow_head_d: 0.12
+  arrow_head_l: 0.18
+  show_velocity_arrows: true
+  show_text: true
+  show_trails: false
+  trail_length: 80

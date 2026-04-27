@@ -1,12 +1,10 @@
 {
   "task": "Swarm-Interception",
   "algorithm": "IPPO",
-  "checkpoint": "/home/wcw/2026-04-05_05-36-17_ippo_torch,3v3最新双教师完整训练，任务成功率95/checkpoints/best_agent.pt",
+  "checkpoint": "/home/wcw/下载/2026-04-21_15-22-15_ippo_torch,1v1速度变慢，0.2延迟/checkpoints/best_agent.pt",
   "agent_name_for_export": "drone_0",
   "possible_agents": [
-    "drone_0",
-    "drone_1",
-    "drone_2"
+    "drone_0"
   ],
   "param_sharing": true,
   "shared_policy_unique_object_count": 1,
@@ -22,10 +20,10 @@
         64,
         128
       ],
-      "num_targets": 3,
-      "obs_k_friends": 2,
-      "obs_k_target": 3,
-      "obs_k_friend_targetpos": 3,
+      "num_targets": 1,
+      "obs_k_friends": 1,
+      "obs_k_target": 1,
+      "obs_k_friend_targetpos": 1,
       "entropy_reg_weight": 0.01,
       "num_heads": 4,
       "use_quaternion": false,
@@ -40,17 +38,17 @@
   "preprocessor": {
     "class": "RunningStandardScaler",
     "kwargs": {
-      "size": 58,
+      "size": 23,
       "epsilon": 1e-08,
       "clip_threshold": 5.0,
       "device": "cpu"
     }
   },
   "observation": {
-    "obs_k_friends": 2,
-    "obs_k_target": 3,
-    "obs_k_friend_targetpos": 3,
-    "single_observation_dim": 58,
+    "obs_k_friends": 1,
+    "obs_k_target": 1,
+    "obs_k_friend_targetpos": 1,
+    "single_observation_dim": 23,
     "observation_layout": [
       "friend_rel_pos: 3 * obs_k_friends",
       "friend_rel_vel: 3 * obs_k_friends",
@@ -70,7 +68,7 @@
       "yaw_rate"
     ],
     "clip_action": 1.0,
-    "a_max": 4.0,
+    "a_max": 2.0,
     "yaw_rate_max": 3.0
   },
   "runtime_dependency_note": "ROS1 inference still depends on local skrl + AssignmentGaussianModel implementation from this repository."

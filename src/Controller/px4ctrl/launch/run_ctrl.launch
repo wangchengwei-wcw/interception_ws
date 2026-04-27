@@ -2,9 +2,12 @@
 
 	<node pkg="px4ctrl" type="px4ctrl_node" name="px4ctrl" output="screen">
 		<!-- <remap from="~odom" to="/odometry/imu_body_incremental" /> -->
-		<remap from="~odom" to="/ekf/ekf_odom" />
-		<remap from="~cmd" to="/position_cmd" />
-
+		<!-- <remap from="~odom" to="/ekf/ekf_odom" /> -->
+		<remap from="~odom" to="/uav0/odom" />
+		<!-- <remap from="~cmd" to="position_cmd" /> -->
+		<remap from="~cmd" to="/uav0/position_cmd" />
+		<!-- <remap from="~cmd" to="/uav1/position_cmd" /> -->
+		<!-- <remap from="~cmd" to="/uav2/position_cmd" /> -->
         <rosparam command="load" file="$(find px4ctrl)/config/ctrl_param_fpv.yaml" />
 	</node>
  

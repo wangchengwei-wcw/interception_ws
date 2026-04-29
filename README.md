@@ -134,7 +134,7 @@
   roslaunch rl_policy spawn_targets.launch
   ```
 
-### 完整启动流程
+### ROS仿真启动流程
 特别注意：在这些launch文件中需要修改使用的yaml文件，用来配置不同数量的飞机与目标数目。
 以下是rviz中仿真的启动流程：
 

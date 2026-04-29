@@ -1,0 +1,156 @@
+# Single-UAV / single-target deployment params.
+# Use this file with the current multi-agent sim_friend_odom_node.py.
+# Launch requirement: start ONE sim_friend_odom node; it internally publishes all /uav*/odom topics.
+
+sim_friend_odom:
+  # Number of friendly UAV odometry streams to simulate.
+  num_agents: 1
+
+  # World/map frame used by fake odom and RViz markers.
+  frame_id: world
+
+  # Fake odom publish/update rate. Use 200Hz to match RL env physics_freq.
+  publish_rate: 200.0
+
+  # Whether to publish friendly UAV markers in RViz.
+  publish_marker: true
+
+  # Per-agent frame/topic mapping.
+  # These three lists must have length = num_agents and must match swarm_state_manager / policy_cmd_bridge.
+  child_frame_ids: [uav0]
+  odom_topics: [/uav0/odom]
+  position_cmd_topics: [/uav0/position_cmd]
+
+  # Friendly UAV initial world poses.
+  # This is the world-origin version: positions are absolute world coordinates, not friend-centroid-relative.
+  initial_positions:
+    - [0.0, 0.0, 1.0]
+
+  initial_yaws_deg: [0.0]
+
+  # Control input source.
+  # Options:
+  #   auto         : prefer fresh PositionCommand, then Twist; otherwise no_cmd_behavior.
+  #   position_cmd : only use quadrotor_msgs/PositionCommand.
+  #   twist        : only use geometry_msgs/Twist.
+  #   param        : ignore commands and keep reading initial_positions/x/y/z/yaw params.
+  control_mode: auto
+
+  # How PositionCommand is interpreted when control_mode uses PositionCommand.
+  # Options:
+  #   direct_setpoint     : odom = PositionCommand position/velocity/yaw/yaw_dot; best for policy/obs debugging.
+  #   track_position      : PD track position/velocity + acceleration feedforward; simple fake controller.
+  #   direct_acceleration : integrate PositionCommand.acceleration.
+  #   direct_velocity     : integrate PositionCommand.velocity.
+  position_cmd_mode: direct_setpoint
+
+  # Command freshness timeout. If no fresh command arrives within this time, use no_cmd_behavior.
+  cmd_timeout_sec: 0.4
+
+  # Behavior when command is missing/stale.
+  # Options:
+  #   hold  : hold current pose and zero velocity.
+  #   brake : brake current velocity using brake_gain default.
+  #   param : fall back to param mode.
+  no_cmd_behavior: hold
+
+  # Safety limits still used by direct_setpoint.
+  max_yaw_rate: 3.0
+  min_z: 1.0
+  max_z: 1.0
+
+  # lock_z=false lets PositionCommand.z pass through, still clipped by min_z/max_z.
+  # Set true only if you want fake odom height forcibly fixed to lock_z_value.
+  lock_z: false
+
+
+enemy_target_manager:
+  # Enemy odom frame and integration frequency. Use 200Hz to match RL env physics_freq.
+  frame_id: world
+  publish_rate: 200.0
+
+  # Number of enemy targets. enemy_odom_topics length must equal enemy_size.
+  enemy_size: 1
+
+  # Topic wiring.
+  # friend_odom_topics must match sim_friend_odom.odom_topics.
+  # enemy_odom_topics are consumed by swarm_state_manager.
+  friend_odom_topics: [/uav0/odom]
+  enemy_odom_topics: [/enemy0/odom]
+
+  # Hit/frozen feedback from swarm_state_manager.
+  friendly_states_topic: /swarm_state_manager/friendly_states
+  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices
+
+  # Target motion model.
+  # Options:
+  #   force_field : goal attraction + pursuer repulsion + enemy separation/cohesion.
+  #   translate   : fly directly toward goal_xyz.
+  enemy_motion_mode: force_field
+
+  # Keep aligned with RL env.
+  enemy_speed: 1.1
+  enemy_goal_radius: 0.1
+  goal_xyz: [0.0, 0.0, 1.0]
+
+  # Force-field parameters. Only used when enemy_motion_mode=force_field.
+  enemy_goal_attraction_weight: 3.0
+  enemy_pursuer_repulsion_weight: 1.5
+  enemy_pursuer_repulsion_range: 40.0
+  enemy_pursuer_repulsion_smooth: 1.0
+  enemy_pursuer_repulsion_max: 2.0
+  enemy_separation_weight: 0.2
+  enemy_separation_range: 1.5
+  enemy_cohesion_weight: 0.2
+  enemy_cohesion_range: 5.0
+
+  # Numerical epsilon for force normalization/division; do not set to 0.
+  enemy_evasive_eps: 1.0e-6
+
+  # Spawn once when the target node starts.
+  spawn_on_start: true
+
+  # Formation selection.
+  # formation_id map in this ROS node:
+  #   0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
+  # You can also set formation_type directly if formation_id is invalid/removed.
+  formation_id: 6
+
+  # Target-cluster geometry.
+  enemy_cluster_ring_radius: 5.0   # Distance from goal_xyz to cluster center.
+  enemy_cluster_radius: 1.0        # Cluster spread radius; also used by arena effective-radius shrink.
+  enemy_height_min: 1.0
+  enemy_height_max: 1.0
+  enemy_min_separation_min: 1.0
+  enemy_min_separation_max: 2.0
+  random_seed: 0
+
+  # Spawn center mode.
+  # Options:
+  #   arena_constrained : keep cluster center inside fixed world-frame arena circle.
+  #   legacy/fixed_theta: center = goal + R*[cos(theta), sin(theta)] without arena constraint.
+  spawn_mode: arena_constrained
+  arena_center_xy: [0.0, 0.0]
+  arena_radius: 6.5
+  arena_margin: 0.2
+
+  # Feasible spawn center selection inside spawn_mode=arena_constrained.
+  # Options:
+  #   front_best      : choose feasible center most aligned with friend yaw.
+  #   random_feasible : randomly choose one feasible center.
+  spawn_selection_mode: front_best
+
+  # World-frame spawn angle fallback/preference.
+  # 0deg corresponds to +x direction from goal when fixed/front constraints allow it.
+  fixed_spawn_theta_deg: 0.0
+
+  # If true, target odom/masks are not released until friendly yaw faces the spawned target center.
+  require_friend_yaw_aligned: true
+  yaw_align_tolerance_deg: 5.0
+  yaw_align_command_topics: [/uav0/position_cmd]
+
+  # RViz topics. Detailed marker style uses node defaults.
+  publish_markers: true
+  marker_topic: /enemy_targets/markers
+  arena_marker_topic: /enemy_targets/arena_marker
+  spawn_constraint_marker_topic: /enemy_targets/spawn_constraint_marker

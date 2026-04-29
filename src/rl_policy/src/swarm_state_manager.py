@@ -146,6 +146,13 @@ class SwarmStateManager:
         self._enemy_frozen_never_received = True
         self._observation_ready_logged = False
 
+        # Previous positions used by CCD hit detection.
+        # This keeps the existing latch semantics unchanged, but replaces
+        # point-sample hit checking with segment/swept-sphere checking.
+        self._prev_hit_fr_pos: Optional[np.ndarray] = None
+        self._prev_hit_en_pos: Optional[np.ndarray] = None
+        self._prev_hit_time_sec: Optional[float] = None
+
         self.friendly_pub = rospy.Publisher(self.friendly_states_topic, Float32MultiArray, queue_size=1)
         self.target_pub = rospy.Publisher(self.target_states_topic, Float32MultiArray, queue_size=1)
         self.visibility_pub = rospy.Publisher(self.target_visibility_topic, Float32MultiArray, queue_size=1)
@@ -406,22 +413,111 @@ class SwarmStateManager:
                     vis[i, j] = 1.0
         return vis
 
-    def _apply_hit_latch(self, fr_pos: np.ndarray, fr_active: np.ndarray, en_pos: np.ndarray, en_valid: np.ndarray) -> None:
+    @staticmethod
+    def _segment_sphere_min_distance_and_alpha(d0: np.ndarray, d1: np.ndarray) -> Tuple[float, float]:
+        """Return min distance from origin to segment d(alpha)=d0+alpha*(d1-d0).
+
+        alpha is clamped to [0, 1]. This is the discrete-time CCD core:
+        d0 is friend-target relative vector at previous state, d1 at current state.
+        If the minimum distance is <= hit_radius, the two swept points intersected
+        the hit sphere sometime during this state interval.
+        """
+        delta = d1 - d0
+        a = float(np.dot(delta, delta))
+        if a <= 1e-12:
+            return float(np.linalg.norm(d0)), 0.0
+        alpha = -float(np.dot(d0, delta)) / a
+        alpha = max(0.0, min(1.0, alpha))
+        closest = d0 + alpha * delta
+        return float(np.linalg.norm(closest)), alpha
+
+    def _update_hit_history(self, fr_pos: np.ndarray, en_pos: np.ndarray, now_sec: float) -> None:
+        self._prev_hit_fr_pos = fr_pos.astype(np.float32).copy()
+        self._prev_hit_en_pos = en_pos.astype(np.float32).copy()
+        self._prev_hit_time_sec = float(now_sec)
+
+    def _apply_hit_latch(
+        self,
+        fr_pos: np.ndarray,
+        fr_active: np.ndarray,
+        en_pos: np.ndarray,
+        en_valid: np.ndarray,
+        now_sec: float,
+    ) -> None:
+        """Latch hits using continuous collision detection over one ROS update interval.
+
+        This intentionally preserves the old latch semantics: the first detected hit
+        freezes the friend and target and publishes last_hit_enemy_indices. It does
+        NOT add unique target ownership or new-wave reset logic.
+        """
+        r = float(self.hit_radius)
+
+        # First frame has no segment history; keep a point-sample fallback only for
+        # the already-overlapping case, then initialize history for later CCD.
+        if (
+            self._prev_hit_fr_pos is None
+            or self._prev_hit_en_pos is None
+            or self._prev_hit_time_sec is None
+            or self._prev_hit_fr_pos.shape != fr_pos.shape
+            or self._prev_hit_en_pos.shape != en_pos.shape
+        ):
+            for i in range(self.num_friendly):
+                if not fr_active[i]:
+                    continue
+                for j in range(self.num_targets):
+                    if not en_valid[j]:
+                        continue
+                    dist = float(np.linalg.norm(fr_pos[i] - en_pos[j]))
+                    if np.isfinite(dist) and dist <= r:
+                        self.friends[i].hit = True
+                        self.friends[i].frozen = True
+                        self.targets[j].frozen = True
+                        self.targets[j].valid = False
+                        self.last_hit_enemy_indices[i] = j
+                        rospy.loginfo_throttle(
+                            0.5,
+                            "Hit latched(point-init): drone_%d -> target_%d (dist=%.3f)",
+                            i, j, dist,
+                        )
+                        break
+            self._update_hit_history(fr_pos, en_pos, now_sec)
+            return
+
+        dt = max(1e-4, float(now_sec) - float(self._prev_hit_time_sec))
+        prev_fr_pos = self._prev_hit_fr_pos
+        prev_en_pos = self._prev_hit_en_pos
+
         for i in range(self.num_friendly):
             if not fr_active[i]:
                 continue
             for j in range(self.num_targets):
                 if not en_valid[j]:
                     continue
-                dist = float(np.linalg.norm(fr_pos[i] - en_pos[j]))
-                if np.isfinite(dist) and dist <= self.hit_radius:
+                if not (
+                    np.isfinite(prev_fr_pos[i]).all()
+                    and np.isfinite(prev_en_pos[j]).all()
+                    and np.isfinite(fr_pos[i]).all()
+                    and np.isfinite(en_pos[j]).all()
+                ):
+                    continue
+
+                d0 = prev_fr_pos[i] - prev_en_pos[j]
+                d1 = fr_pos[i] - en_pos[j]
+                min_dist, alpha = self._segment_sphere_min_distance_and_alpha(d0, d1)
+                if np.isfinite(min_dist) and min_dist <= r:
                     self.friends[i].hit = True
                     self.friends[i].frozen = True
                     self.targets[j].frozen = True
                     self.targets[j].valid = False
                     self.last_hit_enemy_indices[i] = j
-                    rospy.loginfo_throttle(0.5, "Hit latched: drone_%d -> target_%d (dist=%.3f)", i, j, dist)
+                    rospy.loginfo_throttle(
+                        0.5,
+                        "Hit latched(CCD): drone_%d -> target_%d (min_dist=%.3f alpha=%.3f dt=%.3f)",
+                        i, j, min_dist, alpha, dt,
+                    )
                     break
+
+        self._update_hit_history(fr_pos, en_pos, now_sec)
 
     def _build_obs(self, fr_pos: np.ndarray, fr_vel: np.ndarray, fr_yaw: np.ndarray,
                    fr_valid: np.ndarray, fr_active: np.ndarray,
@@ -550,7 +646,7 @@ class SwarmStateManager:
 
                 fr_pos, fr_vel, fr_yaw, fr_valid, fr_active = self._friend_mats()
                 en_pos, en_vel, en_valid = self._target_mats()
-                self._apply_hit_latch(fr_pos, fr_active, en_pos, en_valid)
+                self._apply_hit_latch(fr_pos, fr_active, en_pos, en_valid, now_sec)
                 self._sync_target_validity(now_sec)
                 en_pos, en_vel, en_valid = self._target_mats()
 

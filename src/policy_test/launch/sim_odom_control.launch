@@ -1,0 +1,24 @@
+<launch>
+  <!--
+    Launch only the fake friendly UAV odometry node.
+
+    This node publishes /uav0/odom and /sim_friend_odom/markers.
+    Start this first, then start the target-generation launch separately.
+  -->
+
+  <arg name="params_file" default="$(find policy_test)/config/deployment_params_test_2.yaml"/>
+  <arg name="sim_node_name" default="sim_friend_odom"/>
+  <arg name="sim_node_type" default="sim_friend_odom_node.py"/>
+  <arg name="use_python3_prefix" default="false"/>
+  <arg name="output" default="screen"/>
+
+  <rosparam command="load" file="$(arg params_file)"/>
+
+  <group if="$(arg use_python3_prefix)">
+    <node pkg="policy_test" type="$(arg sim_node_type)" name="$(arg sim_node_name)" output="$(arg output)" launch-prefix="python3"/>
+  </group>
+
+  <group unless="$(arg use_python3_prefix)">
+    <node pkg="policy_test" type="$(arg sim_node_type)" name="$(arg sim_node_name)" output="$(arg output)"/>
+  </group>
+</launch>

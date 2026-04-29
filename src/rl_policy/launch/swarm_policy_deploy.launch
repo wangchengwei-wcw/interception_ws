@@ -8,7 +8,7 @@
 
       roslaunch rl_policy spawn_targets.launch
   -->
-  <arg name="params_file" default="$(find rl_policy)/config/deployment_params.yaml"/>
+  <arg name="params_file" default="$(find rl_policy)/config/deployment_params_2.yaml"/>
 
   <rosparam command="load" file="$(arg params_file)"/>
 

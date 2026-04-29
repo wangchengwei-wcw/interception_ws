@@ -47,7 +47,7 @@ policy_cmd_bridge:
   odom_topics: ["/uav0/odom"]
   px4_command_topics: ["/uav0/position_cmd"]
   hit_enemy_indices_topic: "/swarm_state_manager/hit_enemy_indices"
-  publish_hz: 50.0
+  publish_hz: 200.0
   command_frame_id: "world"
   hover_mode: "explicit"  # "implicit" = stop publishing on hit (px4ctrl timeout hover), "explicit" = hold position
   jerk_mode: "zero"  # Training kept j_desired=0. Optional: "finite_difference" = d(accel_cmd)/dt
@@ -56,10 +56,12 @@ policy_cmd_bridge:
   kv: [0.0, 0.0, 0.0] # seem to be useless
   policy_cmd_timeout_sec: 0.3
   no_policy_behavior: "stop"   # "hover" or "stop"
+  v_max_xy: 1.0
+  v_max_z: 1.0
 
 enemy_target_manager:
   frame_id: "world"
-  publish_rate: 50.0
+  publish_rate: 200.0
   enemy_size: 1
 
   friend_odom_topics: ["/uav0/odom"]
@@ -68,7 +70,7 @@ enemy_target_manager:
   hit_enemy_indices_topic: "/swarm_state_manager/hit_enemy_indices"
 
   enemy_motion_mode: "force_field"
-  enemy_speed: 1.0
+  enemy_speed: 1.1
   enemy_goal_radius: 0.10
   goal_xyz: [0.0, 0.0, 1.0]
 
@@ -76,7 +78,7 @@ enemy_target_manager:
   enemy_pursuer_repulsion_weight: 1.5
   enemy_pursuer_repulsion_range: 40.0
   enemy_pursuer_repulsion_smooth: 1.0
-  enemy_pursuer_repulsion_max: 2.0
+  enemy_pursuer_repulsion_max: 2.5
   enemy_separation_weight: 0.2
   enemy_separation_range: 1.5
   enemy_cohesion_weight: 0.2
@@ -97,6 +99,12 @@ enemy_target_manager:
   random_seed: 0
   # fixed_spawn_theta_deg: -9999.0
   fixed_spawn_theta_deg: 0.0
+  require_friend_yaw_aligned: true
+  yaw_align_tolerance_deg: 5.0
+  yaw_align_command_rate: 0.8
+  yaw_align_command_topics: ["/uav0/position_cmd"]
+  yaw_align_kx: [0.0, 0.0, 0.0]
+  yaw_align_kv: [0.0, 0.0, 0.0]
 
   freeze_when_reach_goal: false
   terminate_on_goal_reach: true

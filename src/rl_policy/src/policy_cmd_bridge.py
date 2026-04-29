@@ -57,6 +57,8 @@ class PolicyCmdBridge:
         self.clip_action = float(action_cfg["clip_action"])
         self.a_max = float(action_cfg["a_max"])
         self.yaw_rate_max = float(action_cfg["yaw_rate_max"])
+        self.v_max_xy = float(rospy.get_param("~v_max_xy", self.bundle_cfg.get("action", {}).get("v_max_xy", 1.0)))
+        self.v_max_z = float(rospy.get_param("~v_max_z", self.bundle_cfg.get("action", {}).get("v_max_z", 1.0)))
         if self.action_dim != 4:
             raise ValueError(f"[policy_cmd_bridge] Expected action_dim=4, got {self.action_dim}")
 
@@ -281,7 +283,7 @@ class PolicyCmdBridge:
         yaw_rate = float(np.clip(yaw_rate, -self.yaw_rate_max, self.yaw_rate_max))
         return accel, yaw_rate
 
-    def _integrate_reference(self, agent_idx: int, accel: np.ndarray, yaw_rate: float, stamp: rospy.Time) -> None:
+    def _integrate_reference(self, agent_idx: int, accel: np.ndarray, yaw_rate: float, stamp: rospy.Time) -> np.ndarray:
         if (not self.reference_valid[agent_idx]) or self.reference_mode[agent_idx] != "normal":
             self._reset_reference_from_odom(agent_idx, stamp, zero_velocity=False)
 
@@ -294,11 +296,24 @@ class PolicyCmdBridge:
                 dt = self.nominal_dt
 
         v_prev = self.desired_velocity[agent_idx].copy()
-        self.desired_velocity[agent_idx][:] = v_prev + accel * dt
-        self.desired_position[agent_idx][:] += v_prev * dt + 0.5 * accel * dt * dt
+        v_new = v_prev + accel * dt
+
+        speed_xy = float(np.linalg.norm(v_new[:2]))
+        if self.v_max_xy > 0.0 and speed_xy > self.v_max_xy:
+            v_new[:2] *= self.v_max_xy / max(speed_xy, 1.0e-9)
+
+        if self.v_max_z > 0.0:
+            v_new[2] = float(np.clip(v_new[2], -self.v_max_z, self.v_max_z))
+
+        accel_after_v_clip = (v_new - v_prev) / max(dt, 1.0e-9)
+
+        self.desired_velocity[agent_idx][:] = v_new
+        self.desired_position[agent_idx][:] += v_prev * dt + 0.5 * accel_after_v_clip * dt * dt
         self.desired_yaw[agent_idx] = _wrap_pi(self.desired_yaw[agent_idx] + yaw_rate * dt)
         self.last_integrate_stamp[agent_idx] = stamp
         self.reference_mode[agent_idx] = "normal"
+
+        return accel_after_v_clip
 
     def _estimate_jerk(self, agent_idx: int, accel: np.ndarray, stamp: rospy.Time, reset: bool = False) -> np.ndarray:
         if reset or self.jerk_mode == "zero":
@@ -348,8 +363,8 @@ class PolicyCmdBridge:
     def _build_policy_command(self, agent_idx: int, stamp: rospy.Time) -> PositionCommand:
         raw = self.latest_policy_cmds[agent_idx]
         accel, yaw_rate = self._limit_command_by_bundle(raw[:3], float(raw[3]))
-        self._integrate_reference(agent_idx, accel, yaw_rate, stamp)
-        return self._make_position_command_from_reference(agent_idx, accel, yaw_rate, stamp)
+        accel_after_v_clip = self._integrate_reference(agent_idx, accel, yaw_rate, stamp)
+        return self._make_position_command_from_reference(agent_idx, accel_after_v_clip, yaw_rate, stamp)
 
     def _build_hover_command(self, agent_idx: int, stamp: rospy.Time) -> PositionCommand:
         if (not self.reference_valid[agent_idx]) or self.reference_mode[agent_idx] != "hover":

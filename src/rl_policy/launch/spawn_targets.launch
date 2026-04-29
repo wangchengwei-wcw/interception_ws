@@ -28,7 +28,7 @@
 
   <group if="$(arg use_python3_prefix)">
     <node pkg="rl_policy"
-          type="spwan_targets_node.py"
+          type="spawn_targets_node.py"
           name="$(arg node_name)"
           output="$(arg output)"
           launch-prefix="python3"/>
@@ -36,7 +36,7 @@
 
   <group unless="$(arg use_python3_prefix)">
     <node pkg="rl_policy"
-          type="spwan_targets_node.py"
+          type="spawn_targets_node.py"
           name="$(arg node_name)"
           output="$(arg output)"/>
   </group>

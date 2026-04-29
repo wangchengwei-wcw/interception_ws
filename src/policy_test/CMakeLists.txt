@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(rl_policy)
+project(policy_test)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
@@ -10,6 +10,7 @@ project(rl_policy)
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   nav_msgs
+  quadrotor_msgs
   rospy
   std_msgs
   visualization_msgs
@@ -72,7 +73,7 @@ find_package(catkin REQUIRED COMPONENTS
 ## Generate added messages and services with any dependencies listed here
 # generate_messages(
 #   DEPENDENCIES
-#   geometry_msgs#   nav_msgs#   std_msgs
+#   geometry_msgs#   nav_msgs#   quadrotor_msgs#   std_msgs#   visualization_msgs
 # )
 
 ################################################
@@ -106,8 +107,8 @@ find_package(catkin REQUIRED COMPONENTS
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
 #  INCLUDE_DIRS include
-#  LIBRARIES rl_policy
-#  CATKIN_DEPENDS geometry_msgs nav_msgs rospy std_msgs visualization_msgs
+#  LIBRARIES policy_test
+#  CATKIN_DEPENDS geometry_msgs nav_msgs quadrotor_msgs rospy std_msgs visualization_msgs
 #  DEPENDS system_lib
 )
 
@@ -124,7 +125,7 @@ include_directories(
 
 ## Declare a C++ library
 # add_library(${PROJECT_NAME}
-#   src/${PROJECT_NAME}/rl_policy.cpp
+#   src/${PROJECT_NAME}/policy_test.cpp
 # )
 
 ## Add cmake target dependencies of the library
@@ -135,7 +136,7 @@ include_directories(
 ## Declare a C++ executable
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
-# add_executable(${PROJECT_NAME}_node src/rl_policy_node.cpp)
+# add_executable(${PROJECT_NAME}_node src/policy_test_node.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -161,13 +162,10 @@ include_directories(
 
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
-catkin_install_python(PROGRAMS
-  src/spawn_targets_node.py
-  src/swarm_state_manager.py
-  src/policy_control_node.py
-  src/policy_cmd_bridge.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
+# catkin_install_python(PROGRAMS
+#   scripts/my_python_script
+#   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+# )
 
 ## Mark executables for installation
 ## See http://docs.ros.org/melodic/api/catkin/html/howto/format1/building_executables.html
@@ -191,16 +189,18 @@ catkin_install_python(PROGRAMS
 # )
 
 ## Mark other files for installation (e.g. launch and bag files, etc.)
-install(DIRECTORY launch config
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
-)
+# install(FILES
+#   # myfile1
+#   # myfile2
+#   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+# )
 
 #############
 ## Testing ##
 #############
 
 ## Add gtest based cpp test target and link libraries
-# catkin_add_gtest(${PROJECT_NAME}-test test/test_rl_policy.cpp)
+# catkin_add_gtest(${PROJECT_NAME}-test test/test_policy_test.cpp)
 # if(TARGET ${PROJECT_NAME}-test)
 #   target_link_libraries(${PROJECT_NAME}-test ${PROJECT_NAME})
 # endif()

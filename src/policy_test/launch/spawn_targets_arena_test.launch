@@ -1,0 +1,29 @@
+<launch>
+  <!--
+    Launch only the enemy/target generation node.
+
+    This node reads /uav0/odom and publishes /enemy0/odom plus RViz markers:
+      /enemy_targets/markers
+      /enemy_targets/arena_marker
+      /enemy_targets/spawn_constraint_marker
+
+    Use this launch repeatedly for each wave if you want to Ctrl-C and restart
+    the target generator while keeping the fake odom node alive.
+  -->
+
+  <arg name="params_file" default="$(find policy_test)/config/deployment_params_test_2.yaml"/>
+  <arg name="target_node_name" default="enemy_target_manager"/>
+  <arg name="target_node_type" default="spawn_targets_node_test.py"/>
+  <arg name="use_python3_prefix" default="false"/>
+  <arg name="output" default="screen"/>
+
+  <rosparam command="load" file="$(arg params_file)"/>
+
+  <group if="$(arg use_python3_prefix)">
+    <node pkg="policy_test" type="$(arg target_node_type)" name="$(arg target_node_name)" output="$(arg output)" launch-prefix="python3"/>
+  </group>
+
+  <group unless="$(arg use_python3_prefix)">
+    <node pkg="policy_test" type="$(arg target_node_type)" name="$(arg target_node_name)" output="$(arg output)"/>
+  </group>
+</launch>

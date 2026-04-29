@@ -134,6 +134,30 @@
   roslaunch rl_policy spawn_targets.launch
   ```
 
+### 完整启动流程
+特别注意：在这些launch文件中需要修改使用的yaml文件，用来配置不同数量的飞机与目标数目。
+以下是rviz中仿真的启动流程：
+
+- **启动总状态管理节点**:
+  ```bash
+  roslaunch rl_policy swarm_policy_deploy.launch
+  ```
+
+- **启动策略控制节点**:
+  ```bash
+  roslaunch rl_policy swarm_policy_control.launch
+  ```
+
+- **启动仿真里程计节点**:
+  ```bash
+  roslaunch policy_test sim_odom_control.launch
+  ```
+
+- **启动目标生成节点**:
+  ```bash
+  roslaunch policy_test spawn_targets_arena_test.launch
+  ```
+
 ## 配置说明
 
 ### 通信配置

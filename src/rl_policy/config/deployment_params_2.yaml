@@ -1,162 +1,132 @@
+# Real deployment parameters: 2 friendly UAVs, 2 targets.
+
 swarm_state_manager:
-  publish_hz: 50.0
-  input_timeout_sec: 0.5
-  target_wait_log_period_sec: 3.0
-  observation_status_log_period_sec: 3.0
-  world_origin_xyz:
-  - 0.0
-  - 0.0
-  - 0.0
-  friend_odom_topics:
-  - /uav0/odom
-  - /uav1/odom
-  enemy_odom_topics:
-  - /enemy0/odom
-  - /enemy1/odom
-  enemy_exists_topic: /enemy_target_manager/enemy_exists
-  enemy_frozen_topic: /enemy_target_manager/enemy_frozen
-  obs_k_friends: 1
-  obs_k_target: 2
-  obs_k_friend_targetpos: 2
-  fov_horizontal_deg: 60.0
-  fov_vertical_deg: 45.0
-  max_visible_distance: 6.0
-  hit_radius: 0.15
-  friendly_states_topic: /swarm_state_manager/friendly_states
-  target_states_topic: /swarm_state_manager/target_states
-  target_visibility_topic: /swarm_state_manager/target_visibility
-  policy_raw_obs_topic: /swarm_state_manager/policy_raw_obs_all
-  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices
-  enemy_alive_topic: /enemy_target_manager/enemy_alive
-  require_enemy_alive_for_policy_obs: true
-  reset_latches_on_new_enemy_alive: true
-  clear_hit_indices_when_no_alive_enemy: true
+  publish_hz: 50.0                         # 状态/观测发布频率；需与策略输入频率匹配
+  input_timeout_sec: 0.5                   # odom 超过该时间未更新则认为失效
+  world_origin_xyz: [0.0, 0.0, 0.0]        # 观测中自身位置的世界原点偏置
+
+  friend_odom_topics: [/uav0/odom, /uav1/odom]       # 真实/桥接后的友机 odom 输入
+  enemy_odom_topics: [/enemy0/odom, /enemy1/odom]         # 目标节点发布的敌机 odom
+  enemy_exists_topic: /enemy_target_manager/enemy_exists  # 目标是否存在的门控 mask
+  enemy_frozen_topic: /enemy_target_manager/enemy_frozen  # 目标是否冻结/已命中的 mask
+
+  obs_k_friends: 1                       # 每架机观测最近的队友数量；需与训练/导出模型一致
+  obs_k_target: 2                        # 每架机观测最近的目标数量；需与训练/导出模型一致
+  obs_k_friend_targetpos: 2              # 观测队友到目标相对位置的 Top-K 数量
+
+  fov_horizontal_deg: 60.0                 # 云台/机体前向水平视场角，用于目标可见性近似
+  fov_vertical_deg: 45.0                   # 云台/机体前向垂直视场角，用于目标可见性近似
+  max_visible_distance: 6.0                # 最大可见距离，需与训练观测配置一致
+  hit_radius: 0.15                         # 命中判定半径，需与训练/实验指标一致
+
+  friendly_states_topic: /swarm_state_manager/friendly_states       # 发布友机聚合状态
+  target_states_topic: /swarm_state_manager/target_states           # 发布目标聚合状态
+  target_visibility_topic: /swarm_state_manager/target_visibility   # 发布可见性矩阵
+  policy_raw_obs_topic: /swarm_state_manager/policy_raw_obs_all     # 发布给策略节点的原始观测
+  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices   # 发布每架友机命中的目标编号
 
 policy_control_node:
-  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
-  device: cpu
-  output_hz: 50.0
-  policy_status_log_period_sec: 3.0
-  policy_raw_obs_topic: /swarm_state_manager/policy_raw_obs_all
-  friendly_states_topic: /swarm_state_manager/friendly_states
-  per_agent_command_topics:
-  - /uav0/policy/command
-  - /uav1/policy/command
-  per_agent_command_stamped_topics:
-  - /uav0/policy/command_stamped
-  - /uav1/policy/command_stamped
-  hover_accel_command:
-  - 0.0
-  - 0.0
-  - 0.0
-  hover_yaw_rate_command: 0.0
-  require_target_alive_for_policy: true
-  enemy_alive_topic: /enemy_target_manager/enemy_alive
-  target_gate_timeout_sec: 0.5
+  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy        # 导出的策略 bundle 目录
+  device: cpu                                                       # 真机部署通常使用 cpu；有 GPU 可改为 cuda
+  output_hz: 50.0                                                   # 策略推理和动作发布频率
+
+  policy_raw_obs_topic: /swarm_state_manager/policy_raw_obs_all     # 订阅状态管理节点输出观测
+  friendly_states_topic: /swarm_state_manager/friendly_states       # 订阅友机状态，用于 hit/frozen 悬停覆盖
+  per_agent_command_topics: [/uav0/policy/command, /uav1/policy/command]                         # 每架机策略输出 [ax, ay, az, yaw_rate]
+
+  hover_accel_command: [0.0, 0.0, 0.0]     # hit/frozen 时覆盖策略输出的加速度
+  hover_yaw_rate_command: 0.0              # hit/frozen 时覆盖策略输出的 yaw_rate
 
 policy_cmd_bridge:
-  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
-  num_agents: 2
-  policy_command_topics:
-  - /uav0/policy/command
-  - /uav1/policy/command
-  odom_topics:
-  - /uav0/odom
-  - /uav1/odom
-  px4_command_topics:
-  - /uav0/position_cmd
-  - /uav1/position_cmd
-  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices
-  publish_hz: 200.0
-  command_frame_id: world
-  hover_mode: explicit
-  jerk_mode: zero
-  jerk_limit: 0.0
-  kx:
-  - 0.0
-  - 0.0
-  - 0.0
-  kv:
-  - 0.0
-  - 0.0
-  - 0.0
-  policy_cmd_timeout_sec: 0.3
-  no_policy_behavior: stop
+  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy              # 与 policy_control_node 使用同一个策略配置
+  num_agents: 2                                                           # 友机数量；下方 topic 数组必须同长度
+  policy_command_topics: [/uav0/policy/command, /uav1/policy/command]     # 订阅策略节点动作输出
+  odom_topics: [/uav0/odom, /uav1/odom]                                   # 订阅真实/桥接后的友机 odom，用于积分参考和悬停点
+  px4_command_topics: [/uav0/position_cmd, /uav1/position_cmd]            # 发布给 px4ctrl 的 PositionCommand
+  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices         # 命中后停止继续追击
+
+  publish_hz: 200.0                        # PositionCommand 发布频率；真机控制建议高于策略频率
+  command_frame_id: world                  # PositionCommand 所在坐标系，需和下游控制器一致
+  hover_mode: explicit                     # 命中后显式发布当前位置悬停指令
+  policy_cmd_timeout_sec: 0.3              # 策略动作超时保护
+  no_policy_behavior: stop                 # 策略缺失时停发，交给下游 failsafe；需要显式悬停可改 hover
+  v_max_xy: 1.0                            # bridge 内部积分速度限幅，需与训练动作限幅一致
+  v_max_z: 1.0                             # z 方向速度限幅，需与训练动作限幅一致
+
+  episode_terminated_topic: /enemy_target_manager/episode_terminated  # 任务失败/结束信号
+  termination_reason_topic: /enemy_target_manager/termination_reason  # 任务结束原因，如 goal_reached
+  termination_behavior: hover              # 任务失败后对未命中友机显式悬停
+  termination_hover_unhit_only: true        # true=只悬停未命中友机；false=所有友机都悬停
 
 enemy_target_manager:
-  frame_id: world
-  publish_rate: 200.0
-  enemy_size: 2
-  friend_odom_topics:
-  - /uav0/odom
-  - /uav1/odom
-  enemy_odom_topics:
-  - /enemy0/odom
-  - /enemy1/odom
-  friendly_states_topic: /swarm_state_manager/friendly_states
-  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices
-  enemy_motion_mode: force_field
-  enemy_speed: 1.0
-  enemy_goal_radius: 0.1
-  goal_xyz:
-  - 0.0
-  - 0.0
-  - 1.0
-  enemy_goal_attraction_weight: 3.0
-  enemy_pursuer_repulsion_weight: 1.5
-  enemy_pursuer_repulsion_range: 40.0
-  enemy_pursuer_repulsion_smooth: 1.0
-  enemy_pursuer_repulsion_max: 2.0
-  enemy_separation_weight: 0.2
-  enemy_separation_range: 1.5
-  enemy_cohesion_weight: 0.2
-  enemy_cohesion_range: 5.0
-  enemy_evasive_eps: 1.0e-06
-  spawn_on_start: true
-  formation_id: 6
-  formation_type: random
-  enemy_cluster_ring_radius: 5.0
-  enemy_cluster_radius: 1.0
-  enemy_height_min: 1.0
-  enemy_height_max: 1.0
-  enemy_min_separation_min: 1.0
-  enemy_min_separation_max: 2.0
-  random_seed: 0
-  fixed_spawn_theta_deg: 0.0
-  require_friend_yaw_aligned: true
-  yaw_align_tolerance_deg: 5.0
-  yaw_align_command_rate: 0.8
-  yaw_align_command_topics:
-  - /uav0/position_cmd
-  - /uav1/position_cmd
-  yaw_align_kx:
-  - 0.0
-  - 0.0
-  - 0.0
-  yaw_align_kv:
-  - 0.0
-  - 0.0
-  - 0.0
-  freeze_when_reach_goal: false
-  terminate_on_goal_reach: true
-  stop_publish_after_terminate: true
-  clear_markers_on_terminate: true
-  freeze_enemy_on_hit: true
-  keep_exists_true_when_hit: true
-  publish_markers: true
-  marker_topic: /enemy_targets/markers
-  enemy_marker_scale: 0.25
-  goal_marker_scale: 0.35
-  arrow_shaft_d: 0.06
-  arrow_head_d: 0.12
-  arrow_head_l: 0.18
-  show_velocity_arrows: true
-  show_text: true
-  show_trails: false
-  trail_length: 80
-  hit_freeze_requires_motion_released: true
-  hit_freeze_min_age_sec: 0.2
-  hit_freeze_validate_distance: true
-  hit_freeze_radius: 0.3
-  hit_ignore_negative_indices: true
-  hit_log_ignored: true
+  frame_id: world                           # 目标 odom 坐标系，需与友机 odom/control 坐标系统一
+  publish_rate: 200.0                       # 目标状态积分/发布频率；与仿真目标节点一致
+  enemy_size: 2                             # 目标数量；enemy_odom_topics 必须同长度
+
+  friend_odom_topics: [/uav0/odom, /uav1/odom]             # 用于目标规避力和起始对齐判断
+  enemy_odom_topics: [/enemy0/odom, /enemy1/odom]          # 发布给 swarm_state_manager 的目标 odom
+  friendly_states_topic: /swarm_state_manager/friendly_states      # 读取 hit/frozen 友机状态
+  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices  # 目标命中冻结输入
+
+  enemy_motion_mode: force_field            # 与仿真一致：目标吸引 + 追击者排斥 + 群体相互作用
+  enemy_speed: 1.1                          # 目标速度；与对应仿真 YAML 保持一致
+  enemy_goal_radius: 0.1                    # 目标抵达 goal 的判定半径
+  goal_xyz: [0.0, 0.0, 1.0]                 # 目标终点/防守点
+
+  enemy_goal_attraction_weight: 3.0         # 目标点吸引力权重
+  enemy_pursuer_repulsion_weight: 1.5       # 友机对目标的排斥力权重
+  enemy_pursuer_repulsion_range: 40.0       # 追击者排斥力作用距离
+  enemy_pursuer_repulsion_smooth: 1.0       # 排斥力平滑参数
+  enemy_pursuer_repulsion_max: 2.0          # 排斥力上限
+  enemy_separation_weight: 0.2              # 目标之间分离力权重
+  enemy_separation_range: 1.5               # 目标之间分离力作用距离
+  enemy_cohesion_weight: 0.2                # 目标之间聚合力权重
+  enemy_cohesion_range: 5.0                 # 目标之间聚合力作用距离
+  enemy_evasive_eps: 1.0e-6                 # 数值稳定项，不要设为 0
+
+  spawn_on_start: true                      # 目标节点启动后立即生成目标
+  formation_id: 1                           # 目标队形模板；与对应仿真 YAML 保持一致
+  enemy_cluster_ring_radius: 5.0            # 目标团中心到 goal_xyz 的出生距离
+  enemy_cluster_radius: 1.0                 # 目标团局部展开半径
+  enemy_height_min: 1.0                     # 目标最低出生高度
+  enemy_height_max: 1.0                     # 目标最高出生高度
+  enemy_min_separation_min: 1.0             # 目标之间最小间距下界
+  enemy_min_separation_max: 2.0             # 目标之间最小间距上界
+  random_seed: 0                            # 随机种子；固定后便于复现实验
+
+  spawn_mode: legacy                        # 与对应仿真 YAML 保持一致
+  # spawn_mode=legacy 时 arena_* 参数不会参与出生点计算，因此实物部署文件中省略。
+  fixed_spawn_theta_deg: 0.0                # 0deg 表示目标团从 goal 的 +x 方向生成
+
+  require_friend_yaw_aligned: true          # 友机未朝向目标团中心前，不释放目标 odom/motion
+  yaw_align_tolerance_deg: 0.5              # yaw 对准容差；真机过严可能导致目标迟迟不释放
+  yaw_align_command_rate: 0.8               # 起始对齐阶段 yaw_rate 限幅/比例
+  yaw_align_release_delay_sec: 1.0          # 对齐后继续保持一段时间再释放目标
+  yaw_align_command_topics: [/uav0/position_cmd, /uav1/position_cmd]    # 起始对齐阶段给友机发 PositionCommand 的话题
+
+  require_friend_formation_aligned: true    # 友机未到 RL 初始队形前，不释放目标 odom/motion
+  friend_agents_per_row: 5                  # RL env 初始队形每排数量
+  friend_lat_spacing: 1.0                   # 同一排友机横向间距
+  friend_row_spacing: 3.0                   # 不同排之间纵向间距
+  friend_row_height_diff: 3.0               # 不同排之间高度差
+  friend_flight_altitude: 1.0               # 第一排友机期望高度
+  friend_formation_anchor_xy: [0.0, 0.0]    # 友机初始队形锚点；一般等于 goal_xyz[:2]
+  friend_formation_position_tolerance: 0.25 # 队形 xy 到位容差；真机可放宽到 0.3~0.4
+  friend_formation_z_tolerance: 0.20        # 队形 z 到位容差
+  require_friend_velocity_aligned: false    # true 时要求友机速度足够小才释放目标
+  friend_formation_velocity_tolerance: 0.25 # 速度到位阈值；仅上面为 true 时生效
+  friend_formation_kx: [1.5, 1.5, 1.5]      # 起始队形移动阶段位置误差增益
+  friend_formation_kv: [1.0, 1.0, 1.0]      # 起始队形移动阶段速度误差增益
+
+  freeze_when_reach_goal: false             # 目标抵达 goal 后不冻结单个目标，而是判任务失败
+  terminate_on_goal_reach: true             # 任一目标抵达 goal 即任务失败
+  stop_publish_after_terminate: true        # 任务结束后停止发布目标 odom
+  clear_markers_on_terminate: true          # 任务结束后清除 RViz 目标 marker
+
+  freeze_enemy_on_hit: true                 # 收到命中结果后冻结对应目标
+  keep_exists_true_when_hit: true           # 命中后目标仍保留 exists，用 frozen 区分状态
+
+  publish_markers: true                     # 发布 RViz marker；不影响控制
+  marker_topic: /enemy_targets/markers      # RViz 主 marker 话题
+  arena_marker_topic: /enemy_targets/arena_marker                 # 场地边界 marker 话题
+  spawn_constraint_marker_topic: /enemy_targets/spawn_constraint_marker # 出生距离约束 marker 话题

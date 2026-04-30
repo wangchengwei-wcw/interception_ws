@@ -40,9 +40,18 @@ def wrap_pi(x: float) -> float:
     return (x + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def yaw_to_quat_xyzw(yaw: float) -> Quaternion:
-    half = 0.5 * yaw
-    return Quaternion(x=0.0, y=0.0, z=math.sin(half), w=math.cos(half))
+def yaw_pitch_to_quat_xyzw(yaw: float, pitch: float) -> Quaternion:
+    # Z-Y-X order with roll=0, matching swarm_interception reset.
+    cy = math.cos(0.5 * yaw)
+    sy = math.sin(0.5 * yaw)
+    cp = math.cos(0.5 * pitch)
+    sp = math.sin(0.5 * pitch)
+    return Quaternion(
+        x=-sp * sy,
+        y=sp * cy,
+        z=cp * sy,
+        w=cp * cy,
+    )
 
 
 def _is_sequence_but_not_str(x: Any) -> bool:
@@ -62,6 +71,7 @@ class AgentState:
     y: float
     z: float
     yaw: float
+    pitch: float = 0.0
     vx: float = 0.0
     vy: float = 0.0
     vz: float = 0.0
@@ -261,6 +271,7 @@ class SimFriendOdomNode:
         # Preferred format:
         #   initial_positions: [[x,y,z], [x,y,z], ...]
         #   initial_yaws_deg: [yaw0, yaw1, ...]
+        #   initial_pitches_deg: [pitch0, pitch1, ...]
         initial_positions = rospy.get_param("~initial_positions", None)
         if _is_sequence_but_not_str(initial_positions) and len(initial_positions) > 0:
             pos_rows = []
@@ -300,6 +311,25 @@ class SimFriendOdomNode:
         if self.num_agents == 1 and rospy.has_param("~yaw_rad"):
             yaws[0] = float(rospy.get_param("~yaw_rad"))
 
+        initial_pitches_deg = rospy.get_param("~initial_pitches_deg", None)
+        if _is_sequence_but_not_str(initial_pitches_deg):
+            pitch_deg = [_safe_float(v) for v in initial_pitches_deg]
+            if len(pitch_deg) < self.num_agents:
+                pitch_deg.extend(pitch_deg[-1] if pitch_deg else 0.0 for _ in range(self.num_agents - len(pitch_deg)))
+            pitches = [math.radians(pitch_deg[i]) for i in range(self.num_agents)]
+        else:
+            initial_pitches_rad = rospy.get_param("~initial_pitches_rad", None)
+            if _is_sequence_but_not_str(initial_pitches_rad):
+                pitches = [_safe_float(v) for v in initial_pitches_rad]
+                if len(pitches) < self.num_agents:
+                    pitches.extend(pitches[-1] if pitches else 0.0 for _ in range(self.num_agents - len(pitches)))
+            else:
+                pitch_deg = self._get_float_vector("pitch_deg", [0.0 for _ in range(self.num_agents)], self.num_agents)
+                pitches = [math.radians(pitch_deg[i]) for i in range(self.num_agents)]
+
+        if self.num_agents == 1 and rospy.has_param("~pitch_rad"):
+            pitches[0] = float(rospy.get_param("~pitch_rad"))
+
         vxs = self._get_float_vector("vx", [0.0 for _ in range(self.num_agents)], self.num_agents)
         vys = self._get_float_vector("vy", [0.0 for _ in range(self.num_agents)], self.num_agents)
         vzs = self._get_float_vector("vz", [0.0 for _ in range(self.num_agents)], self.num_agents)
@@ -307,6 +337,7 @@ class SimFriendOdomNode:
         return [
             AgentState(
                 x=float(xs[i]), y=float(ys[i]), z=float(zs[i]), yaw=wrap_pi(float(yaws[i])),
+                pitch=float(pitches[i]),
                 vx=float(vxs[i]), vy=float(vys[i]), vz=float(vzs[i]), yaw_rate=0.0,
             )
             for i in range(self.num_agents)
@@ -319,6 +350,7 @@ class SimFriendOdomNode:
             self.agents[i].y = st.y
             self.agents[i].z = st.z
             self.agents[i].yaw = st.yaw
+            self.agents[i].pitch = st.pitch
             self.agents[i].vx = st.vx
             self.agents[i].vy = st.vy
             self.agents[i].vz = st.vz
@@ -421,6 +453,7 @@ class SimFriendOdomNode:
         cmd_ay = float(msg.acceleration.y)
         cmd_az = float(msg.acceleration.z)
         cmd_yaw = float(msg.yaw) if hasattr(msg, "yaw") else st.yaw
+        cmd_pitch = float(msg.pitch) if hasattr(msg, "pitch") else st.pitch
         cmd_yaw_dot = float(msg.yaw_dot) if hasattr(msg, "yaw_dot") else 0.0
 
         if self.position_cmd_mode in ("direct_setpoint", "setpoint", "teleport_setpoint"):
@@ -433,6 +466,7 @@ class SimFriendOdomNode:
             self._apply_z_limits(st)
             st.yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, cmd_yaw_dot))
             st.yaw = wrap_pi(cmd_yaw)
+            st.pitch = cmd_pitch
             return
 
         if self.position_cmd_mode == "direct_velocity":
@@ -534,7 +568,7 @@ class SimFriendOdomNode:
         msg.pose.pose.position.x = float(st.x)
         msg.pose.pose.position.y = float(st.y)
         msg.pose.pose.position.z = float(st.z)
-        msg.pose.pose.orientation = yaw_to_quat_xyzw(st.yaw)
+        msg.pose.pose.orientation = yaw_pitch_to_quat_xyzw(st.yaw, st.pitch)
         msg.twist.twist.linear.x = float(st.vx)
         msg.twist.twist.linear.y = float(st.vy)
         msg.twist.twist.linear.z = float(st.vz)
@@ -581,9 +615,9 @@ class SimFriendOdomNode:
             arrow.action = Marker.ADD
             p0 = Point(x=float(st.x), y=float(st.y), z=float(st.z))
             p1 = Point(
-                x=float(st.x + self.arrow_length * math.cos(st.yaw)),
-                y=float(st.y + self.arrow_length * math.sin(st.yaw)),
-                z=float(st.z),
+                x=float(st.x + self.arrow_length * math.cos(st.pitch) * math.cos(st.yaw)),
+                y=float(st.y + self.arrow_length * math.cos(st.pitch) * math.sin(st.yaw)),
+                z=float(st.z + self.arrow_length * math.sin(st.pitch)),
             )
             arrow.points = [p0, p1]
             arrow.scale.x = 0.05
@@ -612,12 +646,13 @@ class SimFriendOdomNode:
             text.color.b = 1.0
             text.color.a = 1.0
             text.text = (
-                "uav{} x={:.2f} y={:.2f} z={:.2f} yaw={:.1f}deg v=({:.2f},{:.2f},{:.2f}) mode={}".format(
+                "uav{} x={:.2f} y={:.2f} z={:.2f} yaw={:.1f}deg pitch={:.1f}deg v=({:.2f},{:.2f},{:.2f}) mode={}".format(
                     i,
                     st.x,
                     st.y,
                     st.z,
                     math.degrees(st.yaw),
+                    math.degrees(st.pitch),
                     st.vx,
                     st.vy,
                     st.vz,

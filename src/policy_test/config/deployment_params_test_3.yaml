@@ -1,18 +1,9 @@
-# 3-UAV / single-target deployment params.
-# Use this file with the current multi-agent sim_friend_odom_node.py.
-# Launch requirement: start ONE sim_friend_odom node; it internally publishes all /uav*/odom topics.
+# 3-UAV / 3-target deployment params, aligned with the 2-UAV / 2-target baseline.
 
 sim_friend_odom:
-  # Number of friendly UAV odometry streams to simulate.
   num_agents: 3
-
-  # World/map frame used by fake odom and RViz markers.
   frame_id: world
-
-  # Fake odom publish/update rate. Use 200Hz to match RL env physics_freq.
   publish_rate: 200.0
-
-  # Whether to publish friendly UAV markers in RViz.
   publish_marker: true
 
   # Per-agent frame/topic mapping.
@@ -23,12 +14,14 @@ sim_friend_odom:
 
   # Friendly UAV initial world poses.
   # This is the world-origin version: positions are absolute world coordinates, not friend-centroid-relative.
+  # They match the RL reset-style formation for fixed_spawn_theta_deg=0.0.
   initial_positions:
     - [0.0, 0.0, 1.0]
     - [0.0, -1.0, 1.0]
     - [0.0, 1.0, 1.0]
 
   initial_yaws_deg: [0.0, 11.309932474020213, -11.309932474020213]
+  initial_pitches_deg: [0.0, 0.0, 0.0]
 
   # Control input source.
   # Options:
@@ -57,9 +50,12 @@ sim_friend_odom:
   no_cmd_behavior: hold
 
   # Safety limits still used by direct_setpoint.
+  min_z: 0.0
+  max_z: 2.5
+  max_speed_xy: 1.0
+  max_speed_z: 1.0
+  max_accel: 2.0
   max_yaw_rate: 3.0
-  min_z: 1.0
-  max_z: 1.0
 
   # lock_z=false lets PositionCommand.z pass through, still clipped by min_z/max_z.
   # Set true only if you want fake odom height forcibly fixed to lock_z_value.
@@ -72,13 +68,13 @@ enemy_target_manager:
   publish_rate: 200.0
 
   # Number of enemy targets. enemy_odom_topics length must equal enemy_size.
-  enemy_size: 1
+  enemy_size: 3
 
   # Topic wiring.
   # friend_odom_topics must match sim_friend_odom.odom_topics.
   # enemy_odom_topics are consumed by swarm_state_manager.
   friend_odom_topics: [/uav0/odom, /uav1/odom, /uav2/odom]
-  enemy_odom_topics: [/enemy0/odom]
+  enemy_odom_topics: [/enemy0/odom, /enemy1/odom, /enemy2/odom]
 
   # Hit/frozen feedback from swarm_state_manager.
   friendly_states_topic: /swarm_state_manager/friendly_states
@@ -116,7 +112,7 @@ enemy_target_manager:
   # formation_id map in this ROS node:
   #   0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
   # You can also set formation_type directly if formation_id is invalid/removed.
-  formation_id: 6
+  formation_id: 1
 
   # Target-cluster geometry.
   enemy_cluster_ring_radius: 5.0   # Distance from goal_xyz to cluster center.
@@ -131,10 +127,10 @@ enemy_target_manager:
   # Options:
   #   arena_constrained : keep cluster center inside fixed world-frame arena circle.
   #   legacy/fixed_theta: center = goal + R*[cos(theta), sin(theta)] without arena constraint.
-  spawn_mode: arena_constrained
+  spawn_mode: legacy
   arena_center_xy: [0.0, 0.0]
-  arena_radius: 6.5
-  arena_margin: 0.2
+  arena_radius: 5.0
+  arena_margin: 0.0
 
   # Feasible spawn center selection inside spawn_mode=arena_constrained.
   # Options:
@@ -145,11 +141,33 @@ enemy_target_manager:
   # World-frame spawn angle fallback/preference.
   # 0deg corresponds to +x direction from goal when fixed/front constraints allow it.
   fixed_spawn_theta_deg: 0.0
+  # fixed_spawn_theta_deg: -9999.0
 
   # If true, target odom/masks are not released until friendly yaw faces the spawned target center.
   require_friend_yaw_aligned: true
-  yaw_align_tolerance_deg: 5.0
+  yaw_align_tolerance_deg: 0.5
+  yaw_align_command_rate: 0.8
+  yaw_align_release_delay_sec: 1.0
   yaw_align_command_topics: [/uav0/position_cmd, /uav1/position_cmd, /uav2/position_cmd]
+
+  # RL-env style friendly pre-start formation gate.
+  # Enemy odom/masks/motion are not released until each friendly UAV reaches
+  # the same initial formation used in SwarmInterceptionEnv reset and faces the target cluster.
+  require_friend_formation_aligned: true
+  friend_agents_per_row: 5
+  friend_lat_spacing: 1.0
+  friend_row_spacing: 3.0
+  friend_row_height_diff: 3.0
+  friend_flight_altitude: 1.0
+  friend_formation_anchor_xy: [0.0, 0.0]
+
+  # Release tolerances for pre-start formation alignment.
+  # For pure fake-odom direct_setpoint testing, these can be tight.
+  # For real UAVs, use looser values such as pos 0.25~0.40m and yaw 3~8deg.
+  friend_formation_position_tolerance: 0.25
+  friend_formation_z_tolerance: 0.20
+  require_friend_velocity_aligned: false
+  friend_formation_velocity_tolerance: 0.25
 
   # RViz topics. Detailed marker style uses node defaults.
   publish_markers: true

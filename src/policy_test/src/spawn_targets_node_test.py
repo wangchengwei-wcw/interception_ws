@@ -155,6 +155,31 @@ class EnemyTargetManager:
         ))
         self.yaw_align_kx = rospy.get_param("~yaw_align_kx", [0.0, 0.0, 0.0])
         self.yaw_align_kv = rospy.get_param("~yaw_align_kv", [0.0, 0.0, 0.0])
+
+        # ------------------ RL-env style friendly pre-start formation ------------------
+        # When enabled, enemy odometry/motion will not be released until all friendly UAVs
+        # reach the same initial formation used by SwarmInterceptionEnv._reset_idx():
+        #   x_local = -row_idx * row_spacing, y_local = [0, -1, +1, -2, +2, ...] * lat_spacing,
+        #   z = flight_altitude + row_idx * row_height_diff,
+        # rotated so the formation faces the spawned enemy cluster center.
+        self.require_friend_formation_aligned = bool(rospy.get_param("~require_friend_formation_aligned", True))
+        self.friend_agents_per_row = int(rospy.get_param("~friend_agents_per_row", 5))
+        self.friend_lat_spacing = float(rospy.get_param("~friend_lat_spacing", 1.0))
+        self.friend_row_spacing = float(rospy.get_param("~friend_row_spacing", 3.0))
+        self.friend_row_height_diff = float(rospy.get_param("~friend_row_height_diff", 3.0))
+        self.friend_flight_altitude = float(rospy.get_param("~friend_flight_altitude", float(self.goal_xyz[2])))
+        self.friend_formation_position_tolerance = float(rospy.get_param("~friend_formation_position_tolerance", 0.25))
+        self.friend_formation_z_tolerance = float(rospy.get_param("~friend_formation_z_tolerance", self.friend_formation_position_tolerance))
+        self.friend_formation_velocity_tolerance = float(rospy.get_param("~friend_formation_velocity_tolerance", 0.25))
+        self.require_friend_velocity_aligned = bool(rospy.get_param("~require_friend_velocity_aligned", False))
+        friend_formation_anchor_xy_param = rospy.get_param("~friend_formation_anchor_xy", None)
+        self.friend_formation_anchor_xy = None if friend_formation_anchor_xy_param is None else np.asarray(friend_formation_anchor_xy_param, dtype=np.float32)
+        if self.friend_formation_anchor_xy is not None and self.friend_formation_anchor_xy.shape[0] != 2:
+            raise ValueError("~friend_formation_anchor_xy must have exactly 2 elements: [x, y]")
+        # Gains written into PositionCommand for downstream controllers that use msg.kx/msg.kv.
+        # If your PX4 controller ignores these fields, it will still receive position/yaw setpoints.
+        self.friend_formation_kx = rospy.get_param("~friend_formation_kx", [1.5, 1.5, 1.5])
+        self.friend_formation_kv = rospy.get_param("~friend_formation_kv", [1.0, 1.0, 1.0])
         self.freeze_when_reach_goal = bool(rospy.get_param("~freeze_when_reach_goal", False))
         self.terminate_on_goal_reach = bool(rospy.get_param("~terminate_on_goal_reach", True))
         self.stop_publish_after_terminate = bool(rospy.get_param("~stop_publish_after_terminate", True))
@@ -202,6 +227,7 @@ class EnemyTargetManager:
         self._motion_released = not self.require_friend_yaw_aligned
         self._yaw_aligned_since: Optional[rospy.Time] = None
         self._spawn_center_xy: Optional[np.ndarray] = None
+        self._friend_formation_targets: Optional[np.ndarray] = None  # [M,3], world-frame desired pre-start positions
         self._enemy_trails: List[List[np.ndarray]] = [[] for _ in range(self.enemy_size)]
         self._episode_terminated = False
         self._termination_reason = ""
@@ -266,6 +292,19 @@ class EnemyTargetManager:
             self.yaw_align_tolerance_deg,
             self.yaw_align_release_delay_sec,
             self.yaw_align_command_topics,
+        )
+        rospy.loginfo(
+            "require_friend_formation_aligned=%s agents_per_row=%d lat_spacing=%.3f row_spacing=%.3f row_height_diff=%.3f flight_altitude=%.3f pos_tol=%.3f z_tol=%.3f vel_tol=%.3f anchor_xy=%s",
+            self.require_friend_formation_aligned,
+            self.friend_agents_per_row,
+            self.friend_lat_spacing,
+            self.friend_row_spacing,
+            self.friend_row_height_diff,
+            self.friend_flight_altitude,
+            self.friend_formation_position_tolerance,
+            self.friend_formation_z_tolerance,
+            self.friend_formation_velocity_tolerance,
+            None if self.friend_formation_anchor_xy is None else self.friend_formation_anchor_xy.tolist(),
         )
         rospy.loginfo("enemy_cluster_ring_radius=%.3f", self.enemy_cluster_ring_radius)
         rospy.loginfo("fixed_spawn_theta_deg=%.3f", self.fixed_spawn_theta_deg)
@@ -346,6 +385,7 @@ class EnemyTargetManager:
         self._enemies_spawned = False
         self._motion_released = not self.require_friend_yaw_aligned
         self._yaw_aligned_since = None
+        self._friend_formation_targets = None
         self._episode_terminated = False
         self._termination_reason = ""
         self._termination_stamp = None
@@ -413,6 +453,107 @@ class EnemyTargetManager:
             return pos[:, :2].mean(axis=0).astype(np.float32)
         return None
 
+    def _friend_formation_anchor_xy(self) -> np.ndarray:
+        """World-frame anchor used by the RL reset-style friendly formation.
+
+        In SwarmInterceptionEnv._reset_idx(), the friendly formation is anchored at
+        terrain.env_origins[:, :2]. In the ROS deployment scene, goal_xyz[:2] is the
+        closest equivalent by default because the enemy goal is built from the same
+        origin in the training env. Override with ~friend_formation_anchor_xy if your
+        real-world takeoff/defense center is different from goal_xyz[:2].
+        """
+        if self.friend_formation_anchor_xy is not None:
+            return self.friend_formation_anchor_xy.astype(np.float32)
+        return self.goal_xyz[:2].astype(np.float32)
+
+    def _compute_friend_formation_targets(self) -> Optional[np.ndarray]:
+        """Compute RL-env reset-style desired positions for friendly UAVs.
+
+        Returns:
+            [M,3] array in world/map frame, where M=len(friend_odom_topics).
+        """
+        center_xy = self._target_center_xy_for_yaw_alignment()
+        if center_xy is None:
+            return None
+        M = len(self.friend_states)
+        if M <= 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        anchor_xy = self._friend_formation_anchor_xy()
+        face_xy = center_xy.astype(np.float32) - anchor_xy.astype(np.float32)
+        n = float(np.linalg.norm(face_xy))
+        if n < 1e-6:
+            face_xy = np.array([1.0, 0.0], dtype=np.float32)
+            n = 1.0
+        f_hat = face_xy / n
+        r_hat = np.array([-f_hat[1], f_hat[0]], dtype=np.float32)
+
+        agents_per_row = max(1, int(self.friend_agents_per_row))
+        out = np.zeros((M, 3), dtype=np.float32)
+        for i in range(M):
+            row_idx = i // agents_per_row
+            local_idx_in_row = i - row_idx * agents_per_row
+            if local_idx_in_row % 2 == 0:
+                pos_idx = local_idx_in_row // 2
+            else:
+                pos_idx = -((local_idx_in_row + 1) // 2)
+
+            x_local = -float(row_idx) * float(self.friend_row_spacing)
+            y_local = float(pos_idx) * float(self.friend_lat_spacing)
+            xy = anchor_xy + x_local * f_hat + y_local * r_hat
+            z = float(self.friend_flight_altitude) + float(row_idx) * float(self.friend_row_height_diff)
+            out[i, 0] = float(xy[0])
+            out[i, 1] = float(xy[1])
+            out[i, 2] = z
+        return out
+
+    def _friend_alignment_errors(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Return position/yaw/speed errors for pre-start release gating.
+
+        Returns:
+            pos_err_xy [M], pos_err_z [M], yaw_err [M], speed [M]
+        """
+        center_xy = self._target_center_xy_for_yaw_alignment()
+        if center_xy is None:
+            return None
+
+        targets = self._friend_formation_targets
+        if targets is None or targets.shape[0] != len(self.friend_states):
+            targets = self._compute_friend_formation_targets()
+            self._friend_formation_targets = targets
+        if targets is None:
+            return None
+
+        pos_err_xy = []
+        pos_err_z = []
+        yaw_errs = []
+        speeds = []
+        for i, st in enumerate(self.friend_states):
+            if not st.received or not np.isfinite(st.pos).all() or not np.isfinite(st.quat_wxyz).all():
+                return None
+            if self.require_friend_formation_aligned:
+                target_pos = targets[i]
+            else:
+                target_pos = st.pos
+            pos_err_xy.append(float(np.linalg.norm(st.pos[:2] - target_pos[:2])))
+            pos_err_z.append(abs(float(st.pos[2] - target_pos[2])))
+
+            to_center = center_xy - st.pos[:2]
+            if np.linalg.norm(to_center) < 1e-6:
+                desired_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            else:
+                desired_yaw = math.atan2(float(to_center[1]), float(to_center[0]))
+            cur_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            yaw_errs.append(_wrap_pi(desired_yaw - cur_yaw))
+            speeds.append(float(np.linalg.norm(st.vel)))
+
+        return (
+            np.asarray(pos_err_xy, dtype=np.float32),
+            np.asarray(pos_err_z, dtype=np.float32),
+            np.asarray(yaw_errs, dtype=np.float32),
+            np.asarray(speeds, dtype=np.float32),
+        )
+
     def _friend_yaw_alignment_errors(self) -> Optional[np.ndarray]:
         center_xy = self._target_center_xy_for_yaw_alignment()
         if center_xy is None:
@@ -431,14 +572,36 @@ class EnemyTargetManager:
         return np.asarray(errors, dtype=np.float32)
 
     def _publish_yaw_align_commands(self, stamp: rospy.Time) -> None:
+        """Publish pre-start position/yaw commands.
+
+        If require_friend_formation_aligned is true, position setpoints are the RL-env
+        reset-style formation targets. Otherwise, positions are held at the current odom
+        positions and only yaw alignment is commanded, matching the old behavior.
+        """
         center_xy = self._target_center_xy_for_yaw_alignment()
         if center_xy is None:
             return
+
+        targets = self._friend_formation_targets
+        if self.require_friend_formation_aligned and (targets is None or targets.shape[0] != len(self.friend_states)):
+            targets = self._compute_friend_formation_targets()
+            self._friend_formation_targets = targets
+
         n = min(len(self.friend_states), len(self.yaw_align_pubs))
         for i in range(n):
             st = self.friend_states[i]
             if not st.received:
                 continue
+
+            if self.require_friend_formation_aligned and targets is not None:
+                target_pos = targets[i]
+                kx = self.friend_formation_kx
+                kv = self.friend_formation_kv
+            else:
+                target_pos = st.pos
+                kx = self.yaw_align_kx
+                kv = self.yaw_align_kv
+
             to_center = center_xy - st.pos[:2]
             if np.linalg.norm(to_center) < 1e-6:
                 desired_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
@@ -451,9 +614,9 @@ class EnemyTargetManager:
             cmd = PositionCommand()
             cmd.header.stamp = stamp
             cmd.header.frame_id = self.frame_id
-            cmd.position.x = float(st.pos[0])
-            cmd.position.y = float(st.pos[1])
-            cmd.position.z = float(st.pos[2])
+            cmd.position.x = float(target_pos[0])
+            cmd.position.y = float(target_pos[1])
+            cmd.position.z = float(target_pos[2])
             cmd.velocity.x = cmd.velocity.y = cmd.velocity.z = 0.0
             cmd.acceleration.x = cmd.acceleration.y = cmd.acceleration.z = 0.0
             if hasattr(cmd, "jerk"):
@@ -464,8 +627,8 @@ class EnemyTargetManager:
             cmd.yaw_dot = yaw_dot
             if hasattr(cmd, "yaw_dot_dot"):
                 cmd.yaw_dot_dot = 0.0
-            cmd.kx = self.yaw_align_kx
-            cmd.kv = self.yaw_align_kv
+            cmd.kx = kx
+            cmd.kv = kv
             if hasattr(cmd, "trajectory_id"):
                 cmd.trajectory_id = 0
             if hasattr(cmd, "trajectory_flag"):
@@ -476,41 +639,54 @@ class EnemyTargetManager:
         if self._motion_released:
             return True
 
-        errors = self._friend_yaw_alignment_errors()
+        errors = self._friend_alignment_errors()
         if errors is None:
             self._yaw_aligned_since = None
-            rospy.logwarn_throttle(1.0, "Waiting for friendly odometry before yaw alignment release")
+            rospy.logwarn_throttle(1.0, "Waiting for friendly odometry before pre-start formation/yaw release")
             return False
 
-        tol = math.radians(self.yaw_align_tolerance_deg)
-        max_err = float(np.max(np.abs(errors))) if errors.size else 0.0
+        pos_err_xy, pos_err_z, yaw_errors, speeds = errors
+        yaw_tol = math.radians(self.yaw_align_tolerance_deg)
+        max_yaw_err = float(np.max(np.abs(yaw_errors))) if yaw_errors.size else 0.0
+        max_pos_xy_err = float(np.max(pos_err_xy)) if pos_err_xy.size else 0.0
+        max_pos_z_err = float(np.max(pos_err_z)) if pos_err_z.size else 0.0
+        max_speed = float(np.max(speeds)) if speeds.size else 0.0
 
-        if max_err <= tol:
-            # All friendly UAVs are currently facing the target cluster center.
+        yaw_ok = max_yaw_err <= yaw_tol if self.require_friend_yaw_aligned else True
+        pos_ok = True
+        if self.require_friend_formation_aligned:
+            pos_ok = (
+                max_pos_xy_err <= float(self.friend_formation_position_tolerance)
+                and max_pos_z_err <= float(self.friend_formation_z_tolerance)
+            )
+        vel_ok = (max_speed <= float(self.friend_formation_velocity_tolerance)) if self.require_friend_velocity_aligned else True
+
+        if yaw_ok and pos_ok and vel_ok:
+            # All friendly UAVs satisfy the pre-start gate.
             # Do not release immediately if yaw_align_release_delay_sec > 0.
-            # During this delay we keep publishing yaw-hold commands and keep
-            # enemy_alive/exist masks at zero, so the policy/bridge can remain gated.
             if self._yaw_aligned_since is None:
                 self._yaw_aligned_since = stamp
                 rospy.loginfo(
-                    "Friendly yaw aligned; waiting %.3fs before releasing enemy odometry/motion. max_yaw_error_deg=%.3f",
+                    "Friendly pre-start alignment satisfied; waiting %.3fs before releasing enemy odometry/motion. max_pos_xy_err=%.3f max_pos_z_err=%.3f max_yaw_error_deg=%.3f max_speed=%.3f",
                     self.yaw_align_release_delay_sec,
-                    math.degrees(max_err),
+                    max_pos_xy_err,
+                    max_pos_z_err,
+                    math.degrees(max_yaw_err),
+                    max_speed,
                 )
 
             elapsed = max(0.0, (stamp - self._yaw_aligned_since).to_sec())
             if elapsed >= max(0.0, self.yaw_align_release_delay_sec):
                 self._motion_released = True
-                # IMPORTANT:
-                # Enemies were spawned earlier, but while yaw alignment / release delay
-                # was active we intentionally did not advance target dynamics or publish
-                # enemy odometry. Reset the dynamics clock here so the first released
-                # step does not integrate with a large dt=(release_time-spawn_time),
-                # which would make targets appear to jump to a closer position.
+                # Reset the dynamics clock so the first released step does not integrate
+                # over the staging time spent moving into the RL-env initial formation.
                 self._last_time = stamp
                 rospy.loginfo(
-                    "Friendly yaw alignment delay complete; releasing enemy odometry/masks and target motion. max_yaw_error_deg=%.3f delay_elapsed=%.3f",
-                    math.degrees(max_err),
+                    "Friendly pre-start alignment complete; releasing enemy odometry/masks and target motion. max_pos_xy_err=%.3f max_pos_z_err=%.3f max_yaw_error_deg=%.3f max_speed=%.3f delay_elapsed=%.3f",
+                    max_pos_xy_err,
+                    max_pos_z_err,
+                    math.degrees(max_yaw_err),
+                    max_speed,
                     elapsed,
                 )
                 self.publish_enemy_masks(force=True)
@@ -521,21 +697,32 @@ class EnemyTargetManager:
             self._publish_yaw_align_commands(stamp)
             rospy.logwarn_throttle(
                 1.0,
-                "Friendly yaw aligned; holding release for %.3fs more. max_yaw_error_deg=%.3f tolerance_deg=%.3f",
+                "Friendly pre-start aligned; holding release for %.3fs more. max_pos_xy_err=%.3f max_pos_z_err=%.3f max_yaw_error_deg=%.3f max_speed=%.3f",
                 max(0.0, self.yaw_align_release_delay_sec - elapsed),
-                math.degrees(max_err),
-                self.yaw_align_tolerance_deg,
+                max_pos_xy_err,
+                max_pos_z_err,
+                math.degrees(max_yaw_err),
+                max_speed,
             )
             return False
 
-        # If any friendly UAV drifts out of tolerance during the delay, restart the delay timer.
+        # If any friendly UAV drifts out of tolerance during the delay, restart the timer.
         self._yaw_aligned_since = None
         self._publish_yaw_align_commands(stamp)
         rospy.logwarn_throttle(
             1.0,
-            "Holding enemy release until all friendly UAVs face target center. max_yaw_error_deg=%.3f tolerance_deg=%.3f",
-            math.degrees(max_err),
+            "Holding enemy release until friendly UAVs match RL reset formation/yaw. pos_ok=%s yaw_ok=%s vel_ok=%s max_pos_xy_err=%.3f/%.3f max_pos_z_err=%.3f/%.3f max_yaw_error_deg=%.3f/%.3f max_speed=%.3f/%.3f",
+            pos_ok,
+            yaw_ok,
+            vel_ok,
+            max_pos_xy_err,
+            self.friend_formation_position_tolerance,
+            max_pos_z_err,
+            self.friend_formation_z_tolerance,
+            math.degrees(max_yaw_err),
             self.yaw_align_tolerance_deg,
+            max_speed,
+            self.friend_formation_velocity_tolerance,
         )
         return False
 

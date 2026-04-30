@@ -19,6 +19,9 @@ sim_friend_odom:
     - [0.0, -1.0, 1.0]
 
   initial_yaws_deg: [0.0, 11.309932474020213]
+  # Pitch also points to the initial target-cluster center. With the default
+  # target height z=1.0 and UAV height z=1.0 this is 0 deg.
+  initial_pitches_deg: [0.0, 0.0]
 
   # Control input source.
   # Options:
@@ -47,8 +50,8 @@ sim_friend_odom:
   no_cmd_behavior: hold
 
   # Safety limits still used by direct_setpoint.
-  min_z: 1.0
-  max_z: 1.0
+  min_z: 0.5
+  max_z: 2.5
   max_speed_xy: 1.0
   max_speed_z: 1.0
   max_accel: 2.0
@@ -109,7 +112,7 @@ enemy_target_manager:
   # formation_id map in this ROS node:
   #   0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
   # You can also set formation_type directly if formation_id is invalid/removed.
-  formation_id: 6
+  formation_id: 0
 
   # Target-cluster geometry.
   enemy_cluster_ring_radius: 5.0   # Distance from goal_xyz to cluster center.
@@ -118,32 +121,46 @@ enemy_target_manager:
   enemy_height_max: 1.0
   enemy_min_separation_min: 1.0
   enemy_min_separation_max: 2.0
-  random_seed: 10
+  random_seed: 300
 
   # Spawn center mode.
   # Options:
   #   arena_constrained : keep cluster center inside fixed world-frame arena circle.
   #   legacy/fixed_theta: center = goal + R*[cos(theta), sin(theta)] without arena constraint.
-  spawn_mode: arena_constrained
+  spawn_mode: legacy
   arena_center_xy: [0.0, 0.0]
-  arena_radius: 6.5
-  arena_margin: 0.2
+  arena_radius: 5.0
+  arena_margin: 0.0
 
   # Feasible spawn center selection inside spawn_mode=arena_constrained.
   # Options:
   #   front_best      : choose feasible center most aligned with friend yaw.
   #   random_feasible : randomly choose one feasible center.
-  spawn_selection_mode: front_best
+  spawn_selection_mode: random_feasible
 
   # World-frame spawn angle fallback/preference.
   # 0deg corresponds to +x direction from goal when fixed/front constraints allow it.
-  fixed_spawn_theta_deg: 0.0
+  # fixed_spawn_theta_deg: 0.0
+  fixed_spawn_theta_deg: -9999.0
 
   # If true, target odom/masks are not released until friendly yaw faces the spawned target center.
   require_friend_yaw_aligned: true
-  yaw_align_tolerance_deg: 1.0
-  yaw_align_release_delay_sec: 3.0
+  yaw_align_tolerance_deg: 0.5
+  yaw_align_release_delay_sec: 1.0
   yaw_align_command_topics: [/uav0/position_cmd, /uav1/position_cmd]
+
+  require_friend_formation_aligned: true
+  friend_formation_position_tolerance: 0.10
+  friend_formation_z_tolerance: 0.10
+  friend_agents_per_row: 5
+  friend_lat_spacing: 1.0
+  friend_row_spacing: 3.0
+  friend_row_height_diff: 3.0
+  friend_flight_altitude: 1.0
+  friend_formation_anchor_xy: [0.0, 0.0]
+
+  require_friend_velocity_aligned: false
+  friend_formation_velocity_tolerance: 0.25
 
   # RViz topics. Detailed marker style uses node defaults.
   publish_markers: true

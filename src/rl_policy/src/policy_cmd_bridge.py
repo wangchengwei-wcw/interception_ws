@@ -110,6 +110,17 @@ class PolicyCmdBridge:
             )
             self.no_policy_behavior = "hover"
 
+        # Safety behavior after the target manager reports mission termination.
+        # For goal_reached / task failure, default to explicit hover so active UAVs
+        # do not keep chasing stale targets and do not rely only on px4ctrl timeout.
+        self.termination_behavior = rospy.get_param("~termination_behavior", "hover")  # "hover" or "stop"
+        if self.termination_behavior not in ("hover", "stop"):
+            rospy.logwarn(
+                f"[policy_cmd_bridge] Invalid termination_behavior '{self.termination_behavior}', falling back to 'hover'"
+            )
+            self.termination_behavior = "hover"
+        self.termination_hover_unhit_only = bool(rospy.get_param("~termination_hover_unhit_only", True))
+
         self._ever_received_policy_cmd = [False] * self.num_agents
         self._last_policy_cmd_stamp = [None] * self.num_agents
         self._policy_cmd_lost_logged = [False] * self.num_agents
@@ -181,10 +192,12 @@ class PolicyCmdBridge:
 
         rospy.loginfo(
             "[policy_cmd_bridge] Ready: bundle_dir=%s, num_agents=%d, action_dim=%d, "
-            "a_max=%.3f, yaw_rate_max=%.3f, hover_mode=%s, jerk_mode=%s, publish_hz=%.1f. "
+            "a_max=%.3f, yaw_rate_max=%.3f, hover_mode=%s, termination_behavior=%s, "
+            "termination_hover_unhit_only=%s, jerk_mode=%s, publish_hz=%.1f. "
             "No dynamics block is used.",
             str(self.bundle_dir), self.num_agents, self.action_dim,
-            self.a_max, self.yaw_rate_max, self.hover_mode, self.jerk_mode, self.publish_hz,
+            self.a_max, self.yaw_rate_max, self.hover_mode, self.termination_behavior,
+            self.termination_hover_unhit_only, self.jerk_mode, self.publish_hz,
         )
 
     def _load_bundle_config(self) -> dict:
@@ -194,7 +207,8 @@ class PolicyCmdBridge:
     def _episode_terminated_cb(self, msg: Bool) -> None:
         if msg.data and not self.episode_terminated:
             rospy.logwarn(
-                f"[policy_cmd_bridge] Enemy episode terminated, switching to hover. reason={self.termination_reason}"
+                f"[policy_cmd_bridge] Enemy episode terminated, applying termination_behavior={self.termination_behavior}. "
+                f"reason={self.termination_reason}"
             )
         elif (not msg.data) and self.episode_terminated:
             rospy.loginfo("[policy_cmd_bridge] Enemy episode restarted, exit termination hover state")
@@ -252,6 +266,14 @@ class PolicyCmdBridge:
 
     def _hit_enemy_indices_cb(self, msg: Int32MultiArray) -> None:
         self.latest_hit_enemy_indices = np.asarray(msg.data, dtype=np.int32)
+
+    @staticmethod
+    def _agent_has_hit(hit_enemy_indices: np.ndarray | None, agent_idx: int) -> bool:
+        return (
+            hit_enemy_indices is not None
+            and hit_enemy_indices.size > agent_idx
+            and hit_enemy_indices[agent_idx] >= 0
+        )
 
     def _invalidate_reference(self, agent_idx: int) -> None:
         self.reference_valid[agent_idx] = False
@@ -390,11 +412,24 @@ class PolicyCmdBridge:
             if not self.latest_odoms[i]["has_data"]:
                 continue
 
+            is_hit = self._agent_has_hit(hit_enemy_indices, i)
+
             if self.episode_terminated:
-                if self.hover_mode == "explicit":
+                should_hover_this_agent = (
+                    self.termination_behavior == "hover"
+                    and ((not self.termination_hover_unhit_only) or (not is_hit))
+                )
+                if should_hover_this_agent:
                     rospy.logwarn_throttle(
                         3.0,
-                        f"[policy_cmd_bridge] Agent {i}: enemy episode terminated ({self.termination_reason}), publishing explicit hover command",
+                        f"[policy_cmd_bridge] Agent {i}: enemy episode terminated ({self.termination_reason}), "
+                        "unhit/active UAV publishing explicit hover command",
+                    )
+                    self.px4_cmd_pubs[i].publish(self._build_hover_command(i, stamp))
+                elif is_hit and self.hover_mode == "explicit":
+                    rospy.loginfo_throttle(
+                        3.0,
+                        f"[policy_cmd_bridge] Agent {i}: episode terminated but agent already hit target, keeping explicit hover",
                     )
                     self.px4_cmd_pubs[i].publish(self._build_hover_command(i, stamp))
                 else:
@@ -404,12 +439,6 @@ class PolicyCmdBridge:
                     )
                     self._stop_publishing(i)
                 continue
-
-            is_hit = (
-                hit_enemy_indices is not None
-                and hit_enemy_indices.size > i
-                and hit_enemy_indices[i] >= 0
-            )
 
             if is_hit and not self.is_hit[i]:
                 self.is_hit[i] = True

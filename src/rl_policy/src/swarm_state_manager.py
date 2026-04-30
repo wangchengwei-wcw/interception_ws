@@ -58,6 +58,17 @@ def _quat_xyzw_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def _quat_xyzw_to_forward_yaw_pitch(qx: float, qy: float, qz: float, qw: float) -> Tuple[float, float]:
+    # Rotate body x-axis by ROS xyzw quaternion. This mirrors the Isaac Lab
+    # observation code where the gimbal is fixed to the UAV body.
+    fx = 1.0 - 2.0 * (qy * qy + qz * qz)
+    fy = 2.0 * (qx * qy + qw * qz)
+    fz = 2.0 * (qx * qz - qw * qy)
+    yaw = math.atan2(fy, fx)
+    pitch = math.atan2(fz, max(math.hypot(fx, fy), 1.0e-6))
+    return yaw, pitch
+
+
 @dataclass
 class FriendlyState:
     id: int
@@ -65,6 +76,7 @@ class FriendlyState:
     velocity: np.ndarray
     yaw: float
     valid: bool
+    pitch: float = 0.0
     frozen: bool = False
     hit: bool = False
     last_stamp: float = 0.0
@@ -201,8 +213,13 @@ class SwarmStateManager:
             st = self.friends[idx]
             st.position = np.array([p.x, p.y, p.z], dtype=np.float32)
             st.velocity = np.array([v.x, v.y, v.z], dtype=np.float32)
-            st.yaw = _quat_xyzw_to_yaw(q.x, q.y, q.z, q.w)
-            st.valid = np.isfinite(st.position).all() and np.isfinite(st.velocity).all() and np.isfinite(st.yaw)
+            st.yaw, st.pitch = _quat_xyzw_to_forward_yaw_pitch(q.x, q.y, q.z, q.w)
+            st.valid = (
+                np.isfinite(st.position).all()
+                and np.isfinite(st.velocity).all()
+                and np.isfinite(st.yaw)
+                and np.isfinite(st.pitch)
+            )
             st.last_stamp = rospy.Time.now().to_sec()
         return _cb
 
@@ -373,16 +390,17 @@ class SwarmStateManager:
                 raw_obs.shape[1],
             )
 
-    def _friend_mats(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _friend_mats(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         pos = np.stack([self.friends[i].position for i in range(self.num_friendly)], axis=0).astype(np.float32)
         vel = np.stack([self.friends[i].velocity for i in range(self.num_friendly)], axis=0).astype(np.float32)
         yaw = np.asarray([self.friends[i].yaw for i in range(self.num_friendly)], dtype=np.float32)
+        pitch = np.asarray([self.friends[i].pitch for i in range(self.num_friendly)], dtype=np.float32)
         valid = np.asarray([self.friends[i].valid for i in range(self.num_friendly)], dtype=bool)
         active = np.asarray(
             [self.friends[i].valid and (not self.friends[i].frozen) and (not self.friends[i].hit) for i in range(self.num_friendly)],
             dtype=bool,
         )
-        return pos, vel, yaw, valid, active
+        return pos, vel, yaw, pitch, valid, active
 
     def _target_mats(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         pos = np.stack([self.targets[j].position for j in range(self.num_targets)], axis=0).astype(np.float32)
@@ -390,7 +408,7 @@ class SwarmStateManager:
         valid = np.asarray([self.targets[j].valid for j in range(self.num_targets)], dtype=bool)
         return pos, vel, valid
 
-    def _compute_visibility(self, fr_pos: np.ndarray, fr_yaw: np.ndarray, fr_active: np.ndarray,
+    def _compute_visibility(self, fr_pos: np.ndarray, fr_yaw: np.ndarray, fr_pitch: np.ndarray, fr_active: np.ndarray,
                             en_pos: np.ndarray, en_valid: np.ndarray) -> np.ndarray:
         vis = np.zeros((self.num_friendly, self.num_targets), dtype=np.float32)
         half_h = 0.5 * math.radians(self.fov_horizontal_deg)
@@ -409,7 +427,8 @@ class SwarmStateManager:
                 dyaw = abs(_wrap_pi(az - float(fr_yaw[i])))
                 horiz = math.hypot(float(rel[0]), float(rel[1]))
                 elev = math.atan2(float(rel[2]), max(horiz, 1e-6))
-                if dyaw <= half_h and abs(elev) <= half_v:
+                dpitch = abs(elev - float(fr_pitch[i]))
+                if dyaw <= half_h and dpitch <= half_v:
                     vis[i, j] = 1.0
         return vis
 
@@ -644,13 +663,13 @@ class SwarmStateManager:
                 self._sync_target_validity(now_sec)
                 self._log_target_wait_state(now_sec)
 
-                fr_pos, fr_vel, fr_yaw, fr_valid, fr_active = self._friend_mats()
+                fr_pos, fr_vel, fr_yaw, fr_pitch, fr_valid, fr_active = self._friend_mats()
                 en_pos, en_vel, en_valid = self._target_mats()
                 self._apply_hit_latch(fr_pos, fr_active, en_pos, en_valid, now_sec)
                 self._sync_target_validity(now_sec)
                 en_pos, en_vel, en_valid = self._target_mats()
 
-                self.last_visibility = self._compute_visibility(fr_pos, fr_yaw, fr_active, en_pos, en_valid)
+                self.last_visibility = self._compute_visibility(fr_pos, fr_yaw, fr_pitch, fr_active, en_pos, en_valid)
                 self.last_raw_obs = self._build_obs(
                     fr_pos, fr_vel, fr_yaw, fr_valid, fr_active,
                     en_pos, en_vel, en_valid, self.last_visibility

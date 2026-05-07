@@ -58,78 +58,78 @@ policy_cmd_bridge:
   termination_behavior: hover               # 任务失败后对未命中友机显式悬停
   termination_hover_unhit_only: true        # true=只悬停未命中友机；false=所有友机都悬停
 
-enemy_target_manager:
-  frame_id: world                           # 目标 odom 坐标系，需与友机 odom/control 坐标系统一
-  publish_rate: 200.0                       # 目标状态积分/发布频率；与仿真目标节点一致
-  enemy_size: 1                             # 目标数量；enemy_odom_topics 必须同长度
+# enemy_target_manager:
+#   frame_id: world                           # 目标 odom 坐标系，需与友机 odom/control 坐标系统一
+#   publish_rate: 200.0                       # 目标状态积分/发布频率；与仿真目标节点一致
+#   enemy_size: 1                             # 目标数量；enemy_odom_topics 必须同长度
 
-  friend_odom_topics: [/uav0/odom]           # 用于目标规避力和起始对齐判断
-  enemy_odom_topics: [/enemy0/odom]          # 发布给 swarm_state_manager 的目标 odom
-  friendly_states_topic: /swarm_state_manager/friendly_states      # 读取 hit/frozen 友机状态
-  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices  # 目标命中冻结输入
+#   friend_odom_topics: [/uav0/odom]           # 用于目标规避力和起始对齐判断
+#   enemy_odom_topics: [/enemy0/odom]          # 发布给 swarm_state_manager 的目标 odom
+#   friendly_states_topic: /swarm_state_manager/friendly_states      # 读取 hit/frozen 友机状态
+#   hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices  # 目标命中冻结输入
 
-  enemy_motion_mode: force_field            # 与仿真一致：目标吸引 + 追击者排斥 + 群体相互作用
-  enemy_speed: 1.1                           # 目标速度；与对应仿真 YAML 保持一致
-  enemy_goal_radius: 0.1                    # 目标抵达 goal 的判定半径
-  goal_xyz: [0.0, 0.0, 1.0]                 # 目标终点/防守点
+#   enemy_motion_mode: force_field            # 与仿真一致：目标吸引 + 追击者排斥 + 群体相互作用
+#   enemy_speed: 1.1                           # 目标速度；与对应仿真 YAML 保持一致
+#   enemy_goal_radius: 0.1                    # 目标抵达 goal 的判定半径
+#   goal_xyz: [0.0, 0.0, 1.0]                 # 目标终点/防守点
 
-  enemy_goal_attraction_weight: 3.0         # 目标点吸引力权重
-  enemy_pursuer_repulsion_weight: 1.5       # 友机对目标的排斥力权重
-  enemy_pursuer_repulsion_range: 40.0       # 追击者排斥力作用距离
-  enemy_pursuer_repulsion_smooth: 1.0       # 排斥力平滑参数
-  enemy_pursuer_repulsion_max: 2.0          # 排斥力上限
-  enemy_separation_weight: 0.2              # 目标之间分离力权重
-  enemy_separation_range: 1.5               # 目标之间分离力作用距离
-  enemy_cohesion_weight: 0.2                # 目标之间聚合力权重
-  enemy_cohesion_range: 5.0                 # 目标之间聚合力作用距离
-  enemy_evasive_eps: 1.0e-6                 # 数值稳定项，不要设为 0
+#   enemy_goal_attraction_weight: 3.0         # 目标点吸引力权重
+#   enemy_pursuer_repulsion_weight: 1.5       # 友机对目标的排斥力权重
+#   enemy_pursuer_repulsion_range: 40.0       # 追击者排斥力作用距离
+#   enemy_pursuer_repulsion_smooth: 1.0       # 排斥力平滑参数
+#   enemy_pursuer_repulsion_max: 2.0          # 排斥力上限
+#   enemy_separation_weight: 0.2              # 目标之间分离力权重
+#   enemy_separation_range: 1.5               # 目标之间分离力作用距离
+#   enemy_cohesion_weight: 0.2                # 目标之间聚合力权重
+#   enemy_cohesion_range: 5.0                 # 目标之间聚合力作用距离
+#   enemy_evasive_eps: 1.0e-6                 # 数值稳定项，不要设为 0
 
-  spawn_on_start: true                      # 目标节点启动后立即生成目标
-  formation_id: 6                         # 目标队形模板；与对应仿真 YAML 保持一致
-  enemy_cluster_ring_radius: 5.0            # 目标团中心到 goal_xyz 的出生距离
-  enemy_cluster_radius: 1.0                 # 目标团局部展开半径
-  enemy_height_min: 1.0                     # 目标最低出生高度
-  enemy_height_max: 1.0                     # 目标最高出生高度
-  enemy_min_separation_min: 1.0             # 目标之间最小间距下界
-  enemy_min_separation_max: 2.0             # 目标之间最小间距上界
-  random_seed: 0                            # 随机种子；固定后便于复现实验
+#   spawn_on_start: true                      # 目标节点启动后立即生成目标
+#   formation_id: 6                         # 目标队形模板；与对应仿真 YAML 保持一致
+#   enemy_cluster_ring_radius: 5.0            # 目标团中心到 goal_xyz 的出生距离
+#   enemy_cluster_radius: 1.0                 # 目标团局部展开半径
+#   enemy_height_min: 1.0                     # 目标最低出生高度
+#   enemy_height_max: 1.0                     # 目标最高出生高度
+#   enemy_min_separation_min: 1.0             # 目标之间最小间距下界
+#   enemy_min_separation_max: 2.0             # 目标之间最小间距上界
+#   random_seed: 0                            # 随机种子；固定后便于复现实验
 
-  spawn_mode: arena_constrained                  # 与对应仿真 YAML 保持一致
-  arena_center_xy: [0.0, 0.0]       # 固定场地圆心；arena_constrained 模式下使用
-  arena_radius: 6.5                 # 固定场地半径；仿真单机目标节点同值
-  arena_margin: 0.2                 # 场地边界安全裕度
-  spawn_selection_mode: front_best  # 从可行出生点中选最接近友机朝向的点
-  fixed_spawn_theta_deg: 0.0                # 0deg 表示目标团从 goal 的 +x 方向生成
+#   spawn_mode: arena_constrained                  # 与对应仿真 YAML 保持一致
+#   arena_center_xy: [0.0, 0.0]       # 固定场地圆心；arena_constrained 模式下使用
+#   arena_radius: 6.5                 # 固定场地半径；仿真单机目标节点同值
+#   arena_margin: 0.2                 # 场地边界安全裕度
+#   spawn_selection_mode: front_best  # 从可行出生点中选最接近友机朝向的点
+#   fixed_spawn_theta_deg: 0.0                # 0deg 表示目标团从 goal 的 +x 方向生成
 
-  require_friend_yaw_aligned: true          # 友机未朝向目标团中心前，不释放目标 odom/motion
-  yaw_align_tolerance_deg: 5.0              # yaw 对准容差；真机过严可能导致目标迟迟不释放
-  yaw_align_command_rate: 0.8               # 起始对齐阶段 yaw_rate 限幅/比例
-  yaw_align_release_delay_sec: 0.0          # 对齐后继续保持一段时间再释放目标
-  yaw_align_command_topics: [/uav0/position_cmd]    # 起始对齐阶段给友机发 PositionCommand 的话题
+#   require_friend_yaw_aligned: true          # 友机未朝向目标团中心前，不释放目标 odom/motion
+#   yaw_align_tolerance_deg: 5.0              # yaw 对准容差；真机过严可能导致目标迟迟不释放
+#   yaw_align_command_rate: 0.8               # 起始对齐阶段 yaw_rate 限幅/比例
+#   yaw_align_release_delay_sec: 0.0          # 对齐后继续保持一段时间再释放目标
+#   yaw_align_command_topics: [/uav0/position_cmd]    # 起始对齐阶段给友机发 PositionCommand 的话题
 
-  require_friend_formation_aligned: true    # 友机未到 RL 初始队形前，不释放目标 odom/motion
-  friend_agents_per_row: 5                  # RL env 初始队形每排数量
-  friend_lat_spacing: 1.0                   # 同一排友机横向间距
-  friend_row_spacing: 3.0                   # 不同排之间纵向间距
-  friend_row_height_diff: 3.0               # 不同排之间高度差
-  friend_flight_altitude: 1.0               # 第一排友机期望高度
-  friend_formation_anchor_xy: [0.0, 0.0]    # 友机初始队形锚点；一般等于 goal_xyz[:2]
-  friend_formation_position_tolerance: 0.25 # 队形 xy 到位容差；真机可放宽到 0.3~0.4
-  friend_formation_z_tolerance: 0.20        # 队形 z 到位容差
-  require_friend_velocity_aligned: false    # true 时要求友机速度足够小才释放目标
-  friend_formation_velocity_tolerance: 0.25 # 速度到位阈值；仅上面为 true 时生效
-  friend_formation_kx: [1.5, 1.5, 1.5]      # 起始队形移动阶段位置误差增益
-  friend_formation_kv: [1.0, 1.0, 1.0]      # 起始队形移动阶段速度误差增益
+#   require_friend_formation_aligned: true    # 友机未到 RL 初始队形前，不释放目标 odom/motion
+#   friend_agents_per_row: 5                  # RL env 初始队形每排数量
+#   friend_lat_spacing: 1.0                   # 同一排友机横向间距
+#   friend_row_spacing: 3.0                   # 不同排之间纵向间距
+#   friend_row_height_diff: 3.0               # 不同排之间高度差
+#   friend_flight_altitude: 1.0               # 第一排友机期望高度
+#   friend_formation_anchor_xy: [0.0, 0.0]    # 友机初始队形锚点；一般等于 goal_xyz[:2]
+#   friend_formation_position_tolerance: 0.25 # 队形 xy 到位容差；真机可放宽到 0.3~0.4
+#   friend_formation_z_tolerance: 0.20        # 队形 z 到位容差
+#   require_friend_velocity_aligned: false    # true 时要求友机速度足够小才释放目标
+#   friend_formation_velocity_tolerance: 0.25 # 速度到位阈值；仅上面为 true 时生效
+#   friend_formation_kx: [1.5, 1.5, 1.5]      # 起始队形移动阶段位置误差增益
+#   friend_formation_kv: [1.0, 1.0, 1.0]      # 起始队形移动阶段速度误差增益
 
-  freeze_when_reach_goal: false             # 目标抵达 goal 后不冻结单个目标，而是判任务失败
-  terminate_on_goal_reach: true             # 任一目标抵达 goal 即任务失败
-  stop_publish_after_terminate: true        # 任务结束后停止发布目标 odom
-  clear_markers_on_terminate: true          # 任务结束后清除 RViz 目标 marker
+#   freeze_when_reach_goal: false             # 目标抵达 goal 后不冻结单个目标，而是判任务失败
+#   terminate_on_goal_reach: true             # 任一目标抵达 goal 即任务失败
+#   stop_publish_after_terminate: true        # 任务结束后停止发布目标 odom
+#   clear_markers_on_terminate: true          # 任务结束后清除 RViz 目标 marker
 
-  freeze_enemy_on_hit: true                 # 收到命中结果后冻结对应目标
-  keep_exists_true_when_hit: true           # 命中后目标仍保留 exists，用 frozen 区分状态
+#   freeze_enemy_on_hit: true                 # 收到命中结果后冻结对应目标
+#   keep_exists_true_when_hit: true           # 命中后目标仍保留 exists，用 frozen 区分状态
 
-  publish_markers: true                     # 发布 RViz marker；不影响控制
-  marker_topic: /enemy_targets/markers      # RViz 主 marker 话题
-  arena_marker_topic: /enemy_targets/arena_marker                 # 场地边界 marker 话题
-  spawn_constraint_marker_topic: /enemy_targets/spawn_constraint_marker # 出生距离约束 marker 话题
+#   publish_markers: true                     # 发布 RViz marker；不影响控制
+#   marker_topic: /enemy_targets/markers      # RViz 主 marker 话题
+#   arena_marker_topic: /enemy_targets/arena_marker                 # 场地边界 marker 话题
+#   spawn_constraint_marker_topic: /enemy_targets/spawn_constraint_marker # 出生距离约束 marker 话题

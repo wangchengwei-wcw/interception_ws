@@ -50,7 +50,7 @@ sim_friend_odom:
   no_cmd_behavior: hold
 
   # Safety limits still used by direct_setpoint.
-  min_z: 0.0
+  min_z: 0.5
   max_z: 2.5
   max_speed_xy: 1.0
   max_speed_z: 1.0
@@ -96,7 +96,7 @@ enemy_target_manager:
   enemy_pursuer_repulsion_weight: 1.5
   enemy_pursuer_repulsion_range: 40.0
   enemy_pursuer_repulsion_smooth: 1.0
-  enemy_pursuer_repulsion_max: 2.0
+  enemy_pursuer_repulsion_max: 2.5
   enemy_separation_weight: 0.2
   enemy_separation_range: 1.5
   enemy_cohesion_weight: 0.2
@@ -112,7 +112,7 @@ enemy_target_manager:
   # formation_id map in this ROS node:
   #   0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
   # You can also set formation_type directly if formation_id is invalid/removed.
-  formation_id: 1
+  formation_id: 0
 
   # Target-cluster geometry.
   enemy_cluster_ring_radius: 5.0   # Distance from goal_xyz to cluster center.
@@ -121,7 +121,7 @@ enemy_target_manager:
   enemy_height_max: 1.0
   enemy_min_separation_min: 1.0
   enemy_min_separation_max: 2.0
-  random_seed: 0
+  random_seed: 102
 
   # Spawn center mode.
   # Options:
@@ -136,17 +136,16 @@ enemy_target_manager:
   # Options:
   #   front_best      : choose feasible center most aligned with friend yaw.
   #   random_feasible : randomly choose one feasible center.
-  spawn_selection_mode: front_best
+  spawn_selection_mode: random_feasible
 
   # World-frame spawn angle fallback/preference.
   # 0deg corresponds to +x direction from goal when fixed/front constraints allow it.
-  fixed_spawn_theta_deg: 0.0
-  # fixed_spawn_theta_deg: -9999.0
+  # fixed_spawn_theta_deg: 0.0
+  fixed_spawn_theta_deg: -9999.0
 
   # If true, target odom/masks are not released until friendly yaw faces the spawned target center.
   require_friend_yaw_aligned: true
   yaw_align_tolerance_deg: 0.5
-  yaw_align_command_rate: 0.8
   yaw_align_release_delay_sec: 1.0
   yaw_align_command_topics: [/uav0/position_cmd, /uav1/position_cmd, /uav2/position_cmd]
 
@@ -154,6 +153,8 @@ enemy_target_manager:
   # Enemy odom/masks/motion are not released until each friendly UAV reaches
   # the same initial formation used in SwarmInterceptionEnv reset and faces the target cluster.
   require_friend_formation_aligned: true
+  friend_formation_position_tolerance: 0.10
+  friend_formation_z_tolerance: 0.10
   friend_agents_per_row: 5
   friend_lat_spacing: 1.0
   friend_row_spacing: 3.0
@@ -164,8 +165,6 @@ enemy_target_manager:
   # Release tolerances for pre-start formation alignment.
   # For pure fake-odom direct_setpoint testing, these can be tight.
   # For real UAVs, use looser values such as pos 0.25~0.40m and yaw 3~8deg.
-  friend_formation_position_tolerance: 0.25
-  friend_formation_z_tolerance: 0.20
   require_friend_velocity_aligned: false
   friend_formation_velocity_tolerance: 0.25
 

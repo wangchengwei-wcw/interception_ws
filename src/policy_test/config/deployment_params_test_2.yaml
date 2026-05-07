@@ -121,7 +121,7 @@ enemy_target_manager:
   enemy_height_max: 1.0
   enemy_min_separation_min: 1.0
   enemy_min_separation_max: 2.0
-  random_seed: 300
+  random_seed: 500
 
   # Spawn center mode.
   # Options:

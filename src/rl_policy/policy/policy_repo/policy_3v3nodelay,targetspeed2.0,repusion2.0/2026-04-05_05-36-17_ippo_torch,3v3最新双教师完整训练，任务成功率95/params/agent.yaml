@@ -1,0 +1,104 @@
+seed: 42
+models:
+  separate: true
+  policy:
+    class: AssignmentGaussianMixin
+    clip_actions: false
+    clip_log_std: true
+    min_log_std: -1.2
+    max_log_std: 0.18
+    initial_log_std: 0.0
+    assignment_embed_dim:
+    - 64
+    - 128
+    num_targets: 3
+    obs_k_friends: 2
+    obs_k_target: 3
+    obs_k_friend_targetpos: 3
+    entropy_reg_weight: 0.01
+    num_heads: 4
+    use_quaternion: false
+    mlp_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+  value:
+    class: DeterministicMixin
+    clip_actions: false
+    network:
+    - name: net
+      input: STATES
+      layers:
+      - 512
+      - 256
+      - 128
+      - 64
+      activations: elu
+    output: ONE
+memory:
+  class: RandomMemory
+  memory_size: -1
+agent:
+  class: IPPO
+  param_sharing: true
+  rollouts: 250
+  learning_epochs: 5
+  mini_batches: 100
+  discount_factor: 0.99
+  lambda: 0.95
+  learning_rate: 5.0e-05
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.01
+    max_lr: 0.0001
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: true
+  entropy_loss_scale: 0.01
+  value_loss_scale: 1.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: false
+  distill_weight_init: 0.0005
+  distill_anneal_type: fixed
+  distill_target_kl: 0.2
+  distill_weight_min: 0.0
+  distill_kl_ema_momentum: 0.95
+  distill_entropy_ema_momentum: 0.95
+  distill_info_gain_success_ema_threshold: 0.05
+  distill_anneal_steps: 60000
+  distill_itad_agreement_cutoff: 0.8
+  distill_itad_zero_streak_n: 10
+  distill_itad_max_down_delta: 0.05
+  distill_itad_max_up_delta: 0.05
+  distill_v2_warmup_steps: 0
+  distill_v2_plateau_steps: 0
+  dual_teacher_enable: true
+  distill_alpha_global: 0.8
+  distill_lambda_consistency: 0.3
+  distill_eta_consensus: 0.6
+  distill_release_mode: success
+  distill_release_success_threshold: 0.8
+  distill_release_patience_updates: 10
+  distill_release_anneal_updates: 250
+  distill_release_interception_threshold: 0.5
+  assignment_margin: 0.7
+  assignment_margin_weight: 0.001
+  assignment_reg_warmup_updates: 0
+  experiment:
+    directory: /home/wcw/swarm_rl/outputs/skrl/Swarm-Interception/flowline
+    experiment_name: 2026-04-05_05-36-17_ippo_torch
+    write_interval: 100
+    checkpoint_interval: 10000
+trainer:
+  class: SequentialTrainer
+  timesteps: 1000000
+  environment_info: log
+  close_environment_at_exit: false

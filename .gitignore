@@ -96,6 +96,5 @@ CTestTestfile.cmake
 Makefile
 
 # RL Policy model files and data
-rl_policy/policy/
-src/rl_policy/policy/
+# src/rl_policy/policy
 

@@ -1,11 +1,12 @@
 {
   "task": "Swarm-Interception",
   "algorithm": "IPPO",
-  "checkpoint": "/home/wcw/2026-04-27_13-36-05_ippo_torch,修改了04-27_05-18-47的目标速度为1.1/checkpoints/best_agent.pt",
+  "checkpoint": "/home/wcw/2026-05-06_10-09-44_ippo_torch,3v3,0.02delay,2.5repusion,1.1speed/checkpoints/best_agent.pt",
   "agent_name_for_export": "drone_0",
   "possible_agents": [
     "drone_0",
-    "drone_1"
+    "drone_1",
+    "drone_2"
   ],
   "param_sharing": true,
   "shared_policy_unique_object_count": 1,
@@ -21,10 +22,10 @@
         64,
         128
       ],
-      "num_targets": 2,
-      "obs_k_friends": 1,
-      "obs_k_target": 2,
-      "obs_k_friend_targetpos": 2,
+      "num_targets": 3,
+      "obs_k_friends": 2,
+      "obs_k_target": 3,
+      "obs_k_friend_targetpos": 3,
       "entropy_reg_weight": 0.01,
       "num_heads": 4,
       "use_quaternion": false,
@@ -39,17 +40,17 @@
   "preprocessor": {
     "class": "RunningStandardScaler",
     "kwargs": {
-      "size": 33,
+      "size": 58,
       "epsilon": 1e-08,
       "clip_threshold": 5.0,
       "device": "cpu"
     }
   },
   "observation": {
-    "obs_k_friends": 1,
-    "obs_k_target": 2,
-    "obs_k_friend_targetpos": 2,
-    "single_observation_dim": 33,
+    "obs_k_friends": 2,
+    "obs_k_target": 3,
+    "obs_k_friend_targetpos": 3,
+    "single_observation_dim": 58,
     "observation_layout": [
       "friend_rel_pos: 3 * obs_k_friends",
       "friend_rel_vel: 3 * obs_k_friends",
@@ -90,14 +91,14 @@
     "target_motion": {
       "naming_note": "The environment code uses enemy_* for target / intercepted-object configuration.",
       "counts": {
-        "friendly_size": 2,
+        "friendly_size": 3,
         "swarm_size": 5,
-        "num_drones": 2,
-        "enemy_size": 2,
-        "enemy_min_num": 2,
-        "enemy_max_num": 2,
+        "num_drones": 3,
+        "enemy_size": 3,
+        "enemy_min_num": 3,
+        "enemy_max_num": 3,
         "friend_follow_enemy_num": true,
-        "obs_k_target": 2
+        "obs_k_target": 3
       },
       "motion": {
         "enemy_motion_mode": "force_field",

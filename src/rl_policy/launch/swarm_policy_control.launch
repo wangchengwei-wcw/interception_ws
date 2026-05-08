@@ -1,5 +1,5 @@
 <launch>
-  <arg name="params_file" default="$(find rl_policy)/config/deployment_params_3.yaml"/>
+  <arg name="params_file" default="$(find rl_policy)/config/deployment_params_auto_real.yaml"/>
 
   <rosparam command="load" file="$(arg params_file)"/>
 

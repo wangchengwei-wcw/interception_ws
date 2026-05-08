@@ -18,8 +18,10 @@ Recommended test flow:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 import rospy
@@ -65,6 +67,102 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _load_bundle_config_from_param() -> tuple[Path, dict]:
+    candidate_params = [
+        "~bundle_dir",
+        "/bundle_dir",
+        "/bundle_deployment_autoconfig/bundle_dir",
+        "/policy_control_node/bundle_dir",
+        "/policy_cmd_bridge/bundle_dir",
+        "/enemy_target_manager/bundle_dir",
+    ]
+    bundle_dir_param = None
+    used_param = None
+    for param_name in candidate_params:
+        value = rospy.get_param(param_name, None)
+        if value is not None and str(value).strip() != "":
+            bundle_dir_param = str(value).strip()
+            used_param = param_name
+            break
+    if bundle_dir_param is None:
+        raise ValueError(
+            "bundle_dir is required. Set ~bundle_dir under sim_friend_odom, or set "
+            "/bundle_dir or /bundle_deployment_autoconfig/bundle_dir."
+        )
+    bundle_dir = Path(str(bundle_dir_param)).expanduser().resolve()
+    config_path = bundle_dir / "policy_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"policy_config.json not found: {config_path} (from {used_param})")
+    rospy.loginfo("[sim_friend_odom] Loaded bundle_dir from %s: %s", used_param, str(bundle_dir))
+    with open(config_path, "r", encoding="utf-8") as f:
+        return bundle_dir, json.load(f)
+
+
+def _infer_friend_count_from_bundle(bundle_cfg: dict) -> int:
+    possible_agents = bundle_cfg.get("possible_agents", [])
+    if isinstance(possible_agents, list) and len(possible_agents) > 0:
+        return int(len(possible_agents))
+
+    counts = bundle_cfg.get("environment", {}).get("target_motion", {}).get("counts", {})
+    for key in ("friendly_size", "num_drones", "swarm_size"):
+        value = counts.get(key)
+        if value is not None:
+            return int(value)
+
+    raise ValueError(
+        "policy_config.json does not contain possible_agents or a friendly count. "
+        "Please re-export the bundle with the updated export script."
+    )
+
+
+def _is_auto_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in ("", "auto")
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0 or (len(value) == 1 and _is_auto_value(value[0]))
+    return False
+
+
+def _get_non_auto_param(name: str, default: Any) -> Any:
+    value = rospy.get_param(name, default)
+    return default if _is_auto_value(value) else value
+
+
+def _bundle_get(cfg: dict, *keys: str, default: Any = None) -> Any:
+    cur: Any = cfg
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _bundle_or_param_float(bundle_cfg: dict, param_name: str, default: float, *bundle_paths: tuple[str, ...]) -> float:
+    """Read a float with bundle priority, then YAML/ROS private parameter, then default.
+
+    Each bundle path is a tuple of keys, e.g. ("action", "v_max_xy").
+    Values explicitly set to null in JSON are treated as missing.
+    """
+    for path in bundle_paths:
+        value = _bundle_get(bundle_cfg, *path, default=None)
+        if value is not None:
+            try:
+                return float(value)
+            except Exception:
+                rospy.logwarn(
+                    "[sim_friend_odom] Invalid bundle value at %s=%r, falling back to ROS/default",
+                    ".".join(path),
+                    value,
+                )
+                break
+    value = rospy.get_param(f"~{param_name}", default)
+    if _is_auto_value(value):
+        return float(default)
+    return float(value)
+
+
 @dataclass
 class AgentState:
     x: float
@@ -85,9 +183,11 @@ class AgentState:
 class SimFriendOdomNode:
     def __init__(self) -> None:
         # ----------------------------- basic -----------------------------
-        self.num_agents = int(rospy.get_param("~num_agents", 1))
+        # Bundle is the single source of truth for the number of friendly UAVs.
+        self.bundle_dir, self.bundle_cfg = _load_bundle_config_from_param()
+        self.num_agents = _infer_friend_count_from_bundle(self.bundle_cfg)
         if self.num_agents <= 0:
-            raise ValueError("~num_agents must be > 0")
+            raise ValueError("bundle friendly count must be > 0")
 
         self.frame_id = rospy.get_param("~frame_id", "world")
         self.publish_rate = float(rospy.get_param("~publish_rate", 50.0))
@@ -110,8 +210,8 @@ class SimFriendOdomNode:
 
         # Backward-compatible single-agent fallback.
         if self.num_agents == 1:
-            self.child_frame_ids[0] = rospy.get_param("~child_frame_id", self.child_frame_ids[0])
-            self.odom_topics[0] = rospy.get_param("~odom_topic", self.odom_topics[0])
+            self.child_frame_ids[0] = _get_non_auto_param("~child_frame_id", self.child_frame_ids[0])
+            self.odom_topics[0] = _get_non_auto_param("~odom_topic", self.odom_topics[0])
 
         # ----------------------------- control ---------------------------
         # Modes:
@@ -138,8 +238,8 @@ class SimFriendOdomNode:
 
         # Backward-compatible single-agent fallback.
         if self.num_agents == 1:
-            self.position_cmd_topics[0] = rospy.get_param("~position_cmd_topic", self.position_cmd_topics[0])
-            self.twist_cmd_topics[0] = rospy.get_param("~twist_cmd_topic", self.twist_cmd_topics[0])
+            self.position_cmd_topics[0] = _get_non_auto_param("~position_cmd_topic", self.position_cmd_topics[0])
+            self.twist_cmd_topics[0] = _get_non_auto_param("~twist_cmd_topic", self.twist_cmd_topics[0])
 
         self.cmd_timeout_sec = float(rospy.get_param("~cmd_timeout_sec", 0.4))
         self.no_cmd_behavior = str(rospy.get_param("~no_cmd_behavior", "hold")).lower()  # hold / brake / param
@@ -158,12 +258,46 @@ class SimFriendOdomNode:
         self.k_yaw = float(rospy.get_param("~k_yaw", rospy.get_param("~k_yaw_hold", 3.0)))
         self.brake_gain = float(rospy.get_param("~brake_gain", 2.0))
 
-        self.max_speed_xy = float(rospy.get_param("~max_speed_xy", 1.0))
-        self.max_speed_z = float(rospy.get_param("~max_speed_z", 1.0))
-        self.max_accel = float(rospy.get_param("~max_accel", 2.0))
-        self.max_yaw_rate = float(rospy.get_param("~max_yaw_rate", 3.0))
-        self.min_z = float(rospy.get_param("~min_z", 0.0))
-        self.max_z = float(rospy.get_param("~max_z", 5.0))
+        # Dynamics / safety limits.  These are bundle-owned when present:
+        #   action.v_max_xy, action.v_max_z, action.a_max, action.yaw_rate_max
+        # min_z / max_z are deployment safety bounds; current exported bundles usually
+        # do not contain them, so YAML remains the normal source for those two.
+        self.max_speed_xy = _bundle_or_param_float(
+            self.bundle_cfg, "max_speed_xy", 1.0,
+            ("action", "v_max_xy"),
+            ("environment", "friendly_dynamics", "max_speed_xy"),
+            ("environment", "dynamics", "v_max_xy"),
+        )
+        self.max_speed_z = _bundle_or_param_float(
+            self.bundle_cfg, "max_speed_z", 1.0,
+            ("action", "v_max_z"),
+            ("environment", "friendly_dynamics", "max_speed_z"),
+            ("environment", "dynamics", "v_max_z"),
+        )
+        self.max_accel = _bundle_or_param_float(
+            self.bundle_cfg, "max_accel", 2.0,
+            ("action", "a_max"),
+            ("environment", "friendly_dynamics", "max_accel"),
+            ("environment", "dynamics", "a_max"),
+        )
+        self.max_yaw_rate = _bundle_or_param_float(
+            self.bundle_cfg, "max_yaw_rate", 3.0,
+            ("action", "yaw_rate_max"),
+            ("environment", "friendly_dynamics", "max_yaw_rate"),
+            ("environment", "dynamics", "yaw_rate_max"),
+        )
+        self.min_z = _bundle_or_param_float(
+            self.bundle_cfg, "min_z", 0.0,
+            ("environment", "friendly_dynamics", "min_z"),
+            ("environment", "dynamics", "min_z"),
+            ("environment", "safety", "min_z"),
+        )
+        self.max_z = _bundle_or_param_float(
+            self.bundle_cfg, "max_z", 5.0,
+            ("environment", "friendly_dynamics", "max_z"),
+            ("environment", "dynamics", "max_z"),
+            ("environment", "safety", "max_z"),
+        )
         self.lock_z = bool(rospy.get_param("~lock_z", False))
         self.lock_z_value = float(rospy.get_param("~lock_z_value", 1.0))
         self.twist_frame = str(rospy.get_param("~twist_frame", "world")).lower()  # world / body
@@ -219,7 +353,8 @@ class SimFriendOdomNode:
         )
 
         rospy.loginfo(
-            "sim_friend_odom_multi ready: num_agents=%d frame_id=%s control_mode=%s position_cmd_mode=%s publish_rate=%.1f",
+            "sim_friend_odom_multi ready: bundle_dir=%s num_agents=%d frame_id=%s control_mode=%s position_cmd_mode=%s publish_rate=%.1f",
+            str(self.bundle_dir),
             self.num_agents,
             self.frame_id,
             self.control_mode,
@@ -229,6 +364,15 @@ class SimFriendOdomNode:
         rospy.loginfo("odom_topics=%s", self.odom_topics)
         rospy.loginfo("position_cmd_topics=%s", self.position_cmd_topics)
         rospy.loginfo("twist_cmd_topics=%s", self.twist_cmd_topics)
+        rospy.loginfo(
+            "dynamics limits: max_speed_xy=%.3f max_speed_z=%.3f max_accel=%.3f max_yaw_rate=%.3f min_z=%.3f max_z=%.3f",
+            self.max_speed_xy,
+            self.max_speed_z,
+            self.max_accel,
+            self.max_yaw_rate,
+            self.min_z,
+            self.max_z,
+        )
         for i, st in enumerate(self.agents):
             rospy.loginfo(
                 "uav%d initial: pos=(%.3f, %.3f, %.3f) yaw=%.3fdeg vel=(%.3f, %.3f, %.3f)",
@@ -239,20 +383,32 @@ class SimFriendOdomNode:
     # Parameter helpers
     # ------------------------------------------------------------------
     def _get_str_list(self, name: str, default: Sequence[str], n: int, allow_empty: bool = False) -> List[str]:
-        value = rospy.get_param(f"~{name}", list(default))
-        if isinstance(value, str):
+        value = rospy.get_param(f"~{name}", "auto")
+        if _is_auto_value(value):
+            values = list(default)
+        elif isinstance(value, str):
             values = [value]
         elif _is_sequence_but_not_str(value):
             values = [str(v) for v in value]
         else:
             values = list(default)
 
+        if len(values) != n:
+            if _is_auto_value(value):
+                values = list(default)
+            else:
+                rospy.logwarn(
+                    "%s length (%d) does not match bundle num_agents (%d); using automatic defaults",
+                    name, len(values), n,
+                )
+                values = list(default)
+
         if len(values) < n:
             values.extend(str(default[i]) if i < len(default) else "" for i in range(len(values), n))
         values = values[:n]
         if not allow_empty:
             for i, v in enumerate(values):
-                if not v:
+                if _is_auto_value(v):
                     values[i] = str(default[i]) if i < len(default) else f"/uav{i}/{name}"
         return values
 
@@ -266,6 +422,36 @@ class SimFriendOdomNode:
         if len(values) < n:
             values.extend(float(default[i]) if i < len(default) else values[-1] for i in range(len(values), n))
         return values[:n]
+
+    def _deploy_param(self, private_name: str, autoconfig_name: str, default: Any) -> Any:
+        value = rospy.get_param(f"~{private_name}", None)
+        if value is not None and not _is_auto_value(value):
+            return value
+        value = rospy.get_param(f"/bundle_deployment_autoconfig/{autoconfig_name}", None)
+        if value is not None and not _is_auto_value(value):
+            return value
+        return default
+
+    def _default_initial_positions(self) -> List[List[float]]:
+        agents_per_row = max(1, int(self._deploy_param("friend_agents_per_row", "friend_agents_per_row", 5)))
+        lat_spacing = float(self._deploy_param("friend_lat_spacing", "friend_lat_spacing", 1.0))
+        row_spacing = float(self._deploy_param("friend_row_spacing", "friend_row_spacing", 3.0))
+        row_height_diff = float(self._deploy_param("friend_row_height_diff", "friend_row_height_diff", 3.0))
+        flight_altitude = float(self._deploy_param("friend_flight_altitude", "friend_flight_altitude", 1.0))
+
+        out: List[List[float]] = []
+        for i in range(self.num_agents):
+            row = i // agents_per_row
+            local_idx = i - row * agents_per_row
+            if local_idx % 2 == 0:
+                pos_idx = local_idx // 2
+            else:
+                pos_idx = -((local_idx + 1) // 2)
+            x = -float(row) * row_spacing
+            y = float(pos_idx) * lat_spacing
+            z = flight_altitude + float(row) * row_height_diff
+            out.append([x, y, z])
+        return out
 
     def _read_initial_states(self) -> List[AgentState]:
         # Preferred format:
@@ -287,9 +473,17 @@ class SimFriendOdomNode:
         else:
             # Backward-compatible split format:
             #   x: [..] / y: [..] / z: [..]
-            xs = self._get_float_vector("x", [0.0 for _ in range(self.num_agents)], self.num_agents)
-            ys = self._get_float_vector("y", [0.0 for _ in range(self.num_agents)], self.num_agents)
-            zs = self._get_float_vector("z", [1.0 for _ in range(self.num_agents)], self.num_agents)
+            # If no explicit pose parameters are provided, spread UAVs in the same
+            # row/lat-spacing formation used by the deployment autoconfig helper.
+            default_positions = self._default_initial_positions()
+            if not (rospy.has_param("~x") or rospy.has_param("~y") or rospy.has_param("~z")):
+                xs = [p[0] for p in default_positions]
+                ys = [p[1] for p in default_positions]
+                zs = [p[2] for p in default_positions]
+            else:
+                xs = self._get_float_vector("x", [p[0] for p in default_positions], self.num_agents)
+                ys = self._get_float_vector("y", [p[1] for p in default_positions], self.num_agents)
+                zs = self._get_float_vector("z", [p[2] for p in default_positions], self.num_agents)
 
         initial_yaws_deg = rospy.get_param("~initial_yaws_deg", None)
         if _is_sequence_but_not_str(initial_yaws_deg):

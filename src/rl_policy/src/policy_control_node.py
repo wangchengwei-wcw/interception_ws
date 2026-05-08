@@ -60,20 +60,26 @@ class PolicyControlNode:
         self.output_hz = float(rospy.get_param("~output_hz", 50.0))             # policy_control_node 跑策略并发布动作的频率
         self.policy_status_log_period_sec = float(rospy.get_param("~policy_status_log_period_sec", 3.0))
 
-        self.policy_raw_obs_topic = rospy.get_param("~policy_raw_obs_topic", "/swarm_state_manager/policy_raw_obs_all")
-        self.friendly_states_topic = rospy.get_param("~friendly_states_topic", "/swarm_state_manager/friendly_states")
-
-        self.per_agent_command_topics = list(rospy.get_param("~per_agent_command_topics", []))
-
-        self.hover_accel_command = np.asarray(rospy.get_param("~hover_accel_command", [0.0, 0.0, 0.0]), dtype=np.float32)
-        self.hover_yaw_rate_command = float(rospy.get_param("~hover_yaw_rate_command", 0.0))
-
         self.bundle_cfg = self._load_bundle_config()
+        self.num_agents = self._bundle_friend_count()
         self.obs_dim = int(self.bundle_cfg["observation"]["single_observation_dim"])
         self.action_dim = int(self.bundle_cfg["action"]["action_dim"])
         self.clip_action = float(self.bundle_cfg["action"]["clip_action"])
         self.a_max = float(self.bundle_cfg["action"]["a_max"])
         self.yaw_rate_max = float(self.bundle_cfg["action"]["yaw_rate_max"])
+
+        self.policy_raw_obs_topic = rospy.get_param("~policy_raw_obs_topic", "/swarm_state_manager/policy_raw_obs_all")
+        self.friendly_states_topic = rospy.get_param("~friendly_states_topic", "/swarm_state_manager/friendly_states")
+
+        self.per_agent_command_topics = self._topic_list_param(
+            "per_agent_command_topics",
+            self.num_agents,
+            lambda i: f"/uav{i}/policy/command",
+            "per_agent_command_topics",
+        )
+
+        self.hover_accel_command = np.asarray(rospy.get_param("~hover_accel_command", [0.0, 0.0, 0.0]), dtype=np.float32)
+        self.hover_yaw_rate_command = float(rospy.get_param("~hover_yaw_rate_command", 0.0))
 
         self.model, self.state_preprocessor = self._load_policy_bundle()
 
@@ -83,8 +89,13 @@ class PolicyControlNode:
 
         self.per_agent_command_pubs = [rospy.Publisher(topic, Float32MultiArray, queue_size=1) for topic in self.per_agent_command_topics]
 
-        self.per_agent_command_stamped_topics = list(
-            rospy.get_param("~per_agent_command_stamped_topics", [])
+        self.per_agent_command_stamped_topics = self._topic_list_param(
+            "per_agent_command_stamped_topics",
+            self.num_agents,
+            lambda i: f"/uav{i}/policy/command_stamped",
+            "per_agent_command_stamped_topics",
+            default=[],
+            allow_empty=True,
         )
         self.per_agent_command_stamped_pubs = [
             rospy.Publisher(topic, TwistStamped, queue_size=1)
@@ -94,7 +105,13 @@ class PolicyControlNode:
         rospy.Subscriber(self.policy_raw_obs_topic, Float32MultiArray, self._raw_obs_cb, queue_size=1)
         rospy.Subscriber(self.friendly_states_topic, Float32MultiArray, self._friendly_states_cb, queue_size=1)
 
-        rospy.loginfo("policy_control_node ready: bundle_dir=%s device=%s", str(self.bundle_dir), str(self.device))
+        rospy.loginfo(
+            "policy_control_node ready: bundle_dir=%s device=%s num_agents=%d obs_dim=%d action_dim=%d",
+            str(self.bundle_dir), str(self.device), self.num_agents, self.obs_dim, self.action_dim,
+        )
+        rospy.loginfo("per_agent_command_topics=%s", self.per_agent_command_topics)
+        if self.per_agent_command_stamped_topics:
+            rospy.loginfo("per_agent_command_stamped_topics=%s", self.per_agent_command_stamped_topics)
 
     def _log_policy_wait_state(self) -> None:
         missing = []
@@ -138,6 +155,61 @@ class PolicyControlNode:
     def _load_bundle_config(self) -> dict:
         with open(self.bundle_dir / "policy_config.json", "r", encoding="utf-8") as f:
             return json.load(f)
+
+    @staticmethod
+    def _is_auto_value(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("", "auto")
+        if isinstance(value, (list, tuple)):
+            return len(value) == 0 or (len(value) == 1 and PolicyControlNode._is_auto_value(value[0]))
+        return False
+
+    def _bundle_get(self, *keys, default=None):
+        cur = self.bundle_cfg
+        for key in keys:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    def _bundle_friend_count(self) -> int:
+        possible_agents = self.bundle_cfg.get("possible_agents", [])
+        if isinstance(possible_agents, list) and len(possible_agents) > 0:
+            return int(len(possible_agents))
+
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("friendly_size", "num_drones", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    n = int(value)
+                    if n > 0:
+                        return n
+
+        raise RuntimeError(
+            "[policy_control_node] policy_config.json does not contain possible_agents or a valid friendly count. "
+            "Please re-export the bundle with deployment metadata."
+        )
+
+    def _topic_list_param(self, ros_name: str, count: int, factory, label: str, default="auto", allow_empty: bool = False) -> list[str]:
+        value = rospy.get_param(f"~{ros_name}", default)
+        if allow_empty and self._is_auto_value(value) and default == []:
+            return []
+        if self._is_auto_value(value):
+            return [factory(i) for i in range(count)]
+        if isinstance(value, str):
+            value = [value]
+        value = [str(x) for x in list(value)]
+        if allow_empty and len(value) == 0:
+            return []
+        if len(value) != count:
+            raise ValueError(
+                f"{label} length ({len(value)}) must equal bundle-derived agent count ({count}). "
+                f"Set ~{ros_name}: auto or remove it to generate topics automatically."
+            )
+        return value
 
     from gymnasium import spaces
 

@@ -1,56 +1,64 @@
-sim_friend_odom:
-  # Required by modified sim_friend_odom_node_auto_bundle.py.
-  # It reads policy_config.json and infers num_agents from possible_agents.
+
+swarm_state_manager:
   bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
 
-  frame_id: world
-  publish_rate: 200.0
-  publish_marker: true
+  publish_hz: 50.0
+  input_timeout_sec: 0.5
+  world_origin_xyz: [0.0, 0.0, 0.0]
 
-  # Topic wiring. Use auto to generate from bundle-derived num_agents:
-  #   child_frame_ids       -> uav0, uav1, ...
-  #   odom_topics           -> /uav0/odom, /uav1/odom, ...
-  #   position_cmd_topics   -> /uav0/position_cmd, /uav1/position_cmd, ...
-  child_frame_ids: auto
+  friend_odom_topics: auto
+  enemy_odom_topics: auto
+  enemy_exists_topic: /enemy_target_manager/enemy_exists
+  enemy_frozen_topic: /enemy_target_manager/enemy_frozen
+
+  friendly_states_topic: /swarm_state_manager/friendly_states
+  target_states_topic: /swarm_state_manager/target_states
+  target_visibility_topic: /swarm_state_manager/target_visibility
+  policy_raw_obs_topic: /swarm_state_manager/policy_raw_obs_all
+  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices
+
+policy_control_node:
+  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
+
+  device: cpu
+  output_hz: 50.0
+  policy_status_log_period_sec: 3.0
+
+  policy_raw_obs_topic: /swarm_state_manager/policy_raw_obs_all
+  friendly_states_topic: /swarm_state_manager/friendly_states
+  per_agent_command_topics: auto
+  per_agent_command_stamped_topics: []
+
+  hover_accel_command: [0.0, 0.0, 0.0]
+  hover_yaw_rate_command: 0.0
+
+policy_cmd_bridge:
+  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
+
+  num_agents: auto
+  policy_command_topics: auto
   odom_topics: auto
-  position_cmd_topics: auto
-  twist_cmd_topics: auto
+  px4_command_topics: auto
 
-  # Friendly UAV initial world poses.
-  # This is the world-origin version: positions are absolute world coordinates, not friend-centroid-relative.
-  # They match the RL reset-style formation for fixed_spawn_theta_deg=0.0.
-  initial_positions:
-    - [0.0, 0.0, 1.0]
-    - [0.0, -1.0, 1.0]
-    - [0.0, 1.0, 1.0]
-  initial_yaws_deg: [0.0, 11.309932474020213, -11.309932474020213]
-  initial_pitches_deg: [0.0, 0.0, 0.0]  # Control input source.
+  publish_hz: 50.0
+  command_frame_id: world
+  policy_cmd_timeout_sec: 0.3
+  no_policy_behavior: stop
 
-  control_mode: auto
-  position_cmd_mode: direct_setpoint
-  cmd_timeout_sec: 0.4
-  no_cmd_behavior: hold
+  hover_mode: implicit
+  termination_behavior: hover
+  termination_hover_unhit_only: true
 
-  # Current exported policy_config.json normally does not contain min_z/max_z,
-  # so these remain deployment safety limits unless you add
-  # environment.friendly_dynamics.min_z/max_z to the JSON/export script.
-  min_z: 0.5
-  max_z: 2.5
-  lock_z: false
+  hit_enemy_indices_topic: /swarm_state_manager/hit_enemy_indices
+  episode_terminated_topic: /enemy_target_manager/episode_terminated
+  termination_reason_topic: /enemy_target_manager/termination_reason
 
-  # These four are now read from JSON action when present:
-  #   max_speed_xy <- action.v_max_xy
-  #   max_speed_z  <- action.v_max_z
-  #   max_accel    <- action.a_max
-  #   max_yaw_rate <- action.yaw_rate_max
-  # Keep them absent or auto unless using an old bundle.
-  # max_speed_xy: auto
-  # max_speed_z: auto
-  # max_accel: auto
-  # max_yaw_rate: auto
+  jerk_mode: zero
+  jerk_limit: 0.0
+  kx: [0.0, 0.0, 0.0]
+  kv: [0.0, 0.0, 0.0]
 
 enemy_target_manager:
-  # Required: exported policy bundle containing policy_config.json.
   bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
 
   # ROS/runtime parameters. These are deployment-owned, not training-owned.
@@ -80,8 +88,8 @@ enemy_target_manager:
   # formation_id map: 0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
   # Set both to auto to infer from bundle formation templates.
   formation_type: auto
-  formation_id: 6
-  random_seed: 92
+  formation_id: 0
+  random_seed: 117
 
   # Feasible spawn center selection inside spawn_mode=arena_constrained.
   # Options:
@@ -93,16 +101,15 @@ enemy_target_manager:
 
   # Pre-start alignment gate.
   require_friend_yaw_aligned: true
-  yaw_align_tolerance_deg: 0.5
+  yaw_align_tolerance_deg: 0.1
   yaw_align_command_rate: 0.8
   yaw_align_release_delay_sec: 1.0
 
   require_friend_formation_aligned: true
-  friend_formation_position_tolerance: 0.10
-  friend_formation_z_tolerance: 0.10
+  friend_formation_position_tolerance: 0.05
+  friend_formation_z_tolerance: 0.05
   require_friend_velocity_aligned: false
   friend_formation_velocity_tolerance: 0.10
-
 
   # ------------------------------ no need to edit below --------------------------------
   # Friendly pre-start formation. These are YAML fallback / deployment controls.
@@ -159,3 +166,54 @@ enemy_target_manager:
   # enemy_height_max: 1.0
   # enemy_min_separation_min: 1.0
   # enemy_min_separation_max: 2.0
+
+sim_friend_odom:
+  # Required by modified sim_friend_odom_node_auto_bundle.py.
+  # It reads policy_config.json and infers num_agents from possible_agents.
+  bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
+
+  frame_id: world
+  publish_rate: 200.0
+  publish_marker: true
+
+  # Topic wiring. Use auto to generate from bundle-derived num_agents:
+  #   child_frame_ids       -> uav0, uav1, ...
+  #   odom_topics           -> /uav0/odom, /uav1/odom, ...
+  #   position_cmd_topics   -> /uav0/position_cmd, /uav1/position_cmd, ...
+  child_frame_ids: auto
+  odom_topics: auto
+  position_cmd_topics: auto
+  twist_cmd_topics: auto
+
+  # Friendly UAV initial world poses.
+  # This is the world-origin version: positions are absolute world coordinates, not friend-centroid-relative.
+  # They match the RL reset-style formation for fixed_spawn_theta_deg=0.0.
+  initial_positions:
+    - [0.0, 0.0, 1.0]
+    - [0.0, -1.0, 1.0]
+    - [0.0, 1.0, 1.0]
+  initial_yaws_deg: [0.0, 11.309932474020213, -11.309932474020213]
+  initial_pitches_deg: [0.0, 0.0, 0.0]  # Control input source.
+
+  control_mode: auto
+  position_cmd_mode: direct_setpoint
+  cmd_timeout_sec: 0.4
+  no_cmd_behavior: hold
+
+  # Current exported policy_config.json normally does not contain min_z/max_z,
+  # so these remain deployment safety limits unless you add
+  # environment.friendly_dynamics.min_z/max_z to the JSON/export script.
+  min_z: 0.5
+  max_z: 2.5
+  lock_z: false
+
+  # These four are now read from JSON action when present:
+  #   max_speed_xy <- action.v_max_xy
+  #   max_speed_z  <- action.v_max_z
+  #   max_accel    <- action.a_max
+  #   max_yaw_rate <- action.yaw_rate_max
+  # Keep them absent or auto unless using an old bundle.
+  # max_speed_xy: auto
+  # max_speed_z: auto
+  # max_accel: auto
+  # max_yaw_rate: auto

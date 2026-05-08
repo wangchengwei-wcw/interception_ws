@@ -6,7 +6,8 @@
     Start this first, then start the target-generation launch separately.
   -->
 
-  <arg name="params_file" default="$(find policy_test)/config/deployment_params_target_auto.yaml"/>
+  <!-- <arg name="params_file" default="$(find policy_test)/config/deployment_params_target_auto.yaml"/> -->
+  <arg name="params_file" default="$(find rl_policy)/config/deployment_params_auto_real.yaml"/>
   <arg name="sim_node_name" default="sim_friend_odom"/>
   <arg name="sim_node_type" default="sim_friend_odom_node.py"/>
   <arg name="use_python3_prefix" default="false"/>

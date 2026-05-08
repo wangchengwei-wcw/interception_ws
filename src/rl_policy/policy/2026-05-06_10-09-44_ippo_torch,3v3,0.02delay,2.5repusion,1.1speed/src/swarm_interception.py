@@ -46,8 +46,8 @@ class SwarmInterceptionCfg(DirectMARLEnvCfg):
 
     # ---------- 数量控制 ----------
     swarm_size: int = 5                 # 便捷参数：同时设置友机/敌机数量
-    friendly_size: int = 2
-    enemy_size: int = 2
+    friendly_size: int = 3
+    enemy_size: int = 3
 
     # 敌机相关
     debug_vis_enemy = True
@@ -65,8 +65,8 @@ class SwarmInterceptionCfg(DirectMARLEnvCfg):
     enemy_min_separation_max: float = 2.0     # 水平间距随机范围上界（设为与min相同则固定间距）
     enemy_vertical_separation: float = 1.0    # 立体队形敌机间最小垂直间隔
     hit_radius = 0.15                          # 命中半径
-    enemy_max_num: int = 2                   # 敌机最多数量（可变编队时使用）
-    enemy_min_num: int = 2                   # 敌机最少数量（可变编队时使用）
+    enemy_max_num: int = 3                   # 敌机最多数量（可变编队时使用）
+    enemy_min_num: int = 3                   # 敌机最少数量（可变编队时使用）
     friend_follow_enemy_num: bool = True      # 便捷开关：是否让友机数量自动跟随敌机数量（一对一）
 
     # Force field 参数（仅在 enemy_motion_mode="force_field" 时生效）
@@ -98,9 +98,9 @@ class SwarmInterceptionCfg(DirectMARLEnvCfg):
     row_height_diff: float  = 3.0      # 高度阶梯 (后排比前排高 1m)
 
     # 观测相关配置
-    obs_k_target: int = 2   # 观测最近的多少个敌机
-    obs_k_friends: int = 1  # 观测最近的多少个队友
-    obs_k_friend_targetpos: int = 2  # 观测最近友机的 Top-K 目标相对位置
+    obs_k_target: int = 3   # 观测最近的多少个敌机
+    obs_k_friends: int = 2  # 观测最近的多少个队友
+    obs_k_friend_targetpos: int = 3  # 观测最近友机的 Top-K 目标相对位置
 
     # Sinkhorn teacher 参数
     sinkhorn_velocity_weight: float = 0.3  # 速度惩罚权重（0=纯距离，0.3=推荐，0.5=强速度）
@@ -191,6 +191,7 @@ class SwarmInterceptionCfg(DirectMARLEnvCfg):
     yaw_rate_max: float = 3.0
     lowpass_filter_cutoff_freq: float = 10000.0
     torque_ctrl_delay_s: float = 0.02
+    # torque_ctrl_delay_s: float = 0.0
 
     # real dynamics for crazyflie（仅供参考，未严格对应真实参数）
     # a_max: float = 2.5

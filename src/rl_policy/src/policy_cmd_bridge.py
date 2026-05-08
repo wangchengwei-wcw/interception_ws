@@ -47,33 +47,39 @@ def _yaw_from_odom(msg: Odometry) -> float:
 
 class PolicyCmdBridge:
     def __init__(self) -> None:
-        self.num_agents = int(rospy.get_param("~num_agents", 1))
-
         # Match policy_control_node: load the exported bundle config.
         self.bundle_dir = Path(rospy.get_param("~bundle_dir")).resolve()
         self.bundle_cfg = self._load_bundle_config()
+        self.num_agents = self._read_num_agents()
+
         action_cfg = self.bundle_cfg["action"]
         self.action_dim = int(action_cfg["action_dim"])
         self.clip_action = float(action_cfg["clip_action"])
         self.a_max = float(action_cfg["a_max"])
         self.yaw_rate_max = float(action_cfg["yaw_rate_max"])
-        self.v_max_xy = float(rospy.get_param("~v_max_xy", self.bundle_cfg.get("action", {}).get("v_max_xy", 1.0)))
-        self.v_max_z = float(rospy.get_param("~v_max_z", self.bundle_cfg.get("action", {}).get("v_max_z", 1.0)))
+        self.v_max_xy = float(rospy.get_param("~v_max_xy", action_cfg.get("v_max_xy", 1.0)))
+        self.v_max_z = float(rospy.get_param("~v_max_z", action_cfg.get("v_max_z", 1.0)))
         if self.action_dim != 4:
             raise ValueError(f"[policy_cmd_bridge] Expected action_dim=4, got {self.action_dim}")
 
-        self.policy_cmd_topics = list(rospy.get_param(
-            "~policy_command_topics",
-            [f"/uav{i}/policy/command" for i in range(self.num_agents)]
-        ))
-        self.odom_topics = list(rospy.get_param(
-            "~odom_topics",
-            [f"/uav{i}/odom" for i in range(self.num_agents)]
-        ))
-        self.px4_cmd_topics = list(rospy.get_param(
-            "~px4_command_topics",
-            [f"/uav{i}/cmd" for i in range(self.num_agents)]
-        ))
+        self.policy_cmd_topics = self._topic_list_param(
+            "policy_command_topics",
+            self.num_agents,
+            lambda i: f"/uav{i}/policy/command",
+            "policy_command_topics",
+        )
+        self.odom_topics = self._topic_list_param(
+            "odom_topics",
+            self.num_agents,
+            lambda i: f"/uav{i}/odom",
+            "odom_topics",
+        )
+        self.px4_cmd_topics = self._topic_list_param(
+            "px4_command_topics",
+            self.num_agents,
+            lambda i: f"/uav{i}/position_cmd",
+            "px4_command_topics",
+        )
         self.hit_enemy_indices_topic = rospy.get_param(
             "~hit_enemy_indices_topic", "/swarm_state_manager/hit_enemy_indices"
         )
@@ -192,17 +198,85 @@ class PolicyCmdBridge:
 
         rospy.loginfo(
             "[policy_cmd_bridge] Ready: bundle_dir=%s, num_agents=%d, action_dim=%d, "
-            "a_max=%.3f, yaw_rate_max=%.3f, hover_mode=%s, termination_behavior=%s, "
-            "termination_hover_unhit_only=%s, jerk_mode=%s, publish_hz=%.1f. "
-            "No dynamics block is used.",
+            "a_max=%.3f, v_max_xy=%.3f, v_max_z=%.3f, yaw_rate_max=%.3f, hover_mode=%s, "
+            "termination_behavior=%s, termination_hover_unhit_only=%s, jerk_mode=%s, publish_hz=%.1f.",
             str(self.bundle_dir), self.num_agents, self.action_dim,
-            self.a_max, self.yaw_rate_max, self.hover_mode, self.termination_behavior,
-            self.termination_hover_unhit_only, self.jerk_mode, self.publish_hz,
+            self.a_max, self.v_max_xy, self.v_max_z, self.yaw_rate_max, self.hover_mode,
+            self.termination_behavior, self.termination_hover_unhit_only, self.jerk_mode, self.publish_hz,
         )
+        rospy.loginfo("[policy_cmd_bridge] policy_command_topics=%s", self.policy_cmd_topics)
+        rospy.loginfo("[policy_cmd_bridge] odom_topics=%s", self.odom_topics)
+        rospy.loginfo("[policy_cmd_bridge] px4_command_topics=%s", self.px4_cmd_topics)
 
     def _load_bundle_config(self) -> dict:
         with open(self.bundle_dir / "policy_config.json", "r", encoding="utf-8") as f:
             return json.load(f)
+
+    @staticmethod
+    def _is_auto_value(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("", "auto")
+        if isinstance(value, (list, tuple)):
+            return len(value) == 0 or (len(value) == 1 and PolicyCmdBridge._is_auto_value(value[0]))
+        return False
+
+    def _bundle_get(self, *keys, default=None):
+        cur = self.bundle_cfg
+        for key in keys:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    def _bundle_friend_count(self) -> int:
+        possible_agents = self.bundle_cfg.get("possible_agents", [])
+        if isinstance(possible_agents, list) and len(possible_agents) > 0:
+            return int(len(possible_agents))
+
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("friendly_size", "num_drones", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    n = int(value)
+                    if n > 0:
+                        return n
+
+        raise RuntimeError(
+            "[policy_cmd_bridge] policy_config.json does not contain possible_agents or a valid friendly count. "
+            "Please re-export the bundle with deployment metadata."
+        )
+
+    def _read_num_agents(self) -> int:
+        value = rospy.get_param("~num_agents", "auto")
+        if self._is_auto_value(value):
+            return self._bundle_friend_count()
+        n = int(value)
+        bundle_n = self._bundle_friend_count()
+        if n != bundle_n:
+            rospy.logwarn(
+                "[policy_cmd_bridge] ~num_agents=%d differs from bundle-derived possible_agents count=%d; using YAML override",
+                n, bundle_n,
+            )
+        if n <= 0:
+            raise ValueError("~num_agents must be > 0")
+        return n
+
+    def _topic_list_param(self, ros_name: str, count: int, factory, label: str) -> list[str]:
+        value = rospy.get_param(f"~{ros_name}", "auto")
+        if self._is_auto_value(value):
+            return [factory(i) for i in range(count)]
+        if isinstance(value, str):
+            value = [value]
+        value = [str(x) for x in list(value)]
+        if len(value) != count:
+            raise ValueError(
+                f"{label} length ({len(value)}) must equal agent count ({count}). "
+                f"Set ~{ros_name}: auto or remove it to generate topics automatically."
+            )
+        return value
 
     def _episode_terminated_cb(self, msg: Bool) -> None:
         if msg.data and not self.episode_terminated:

@@ -31,7 +31,9 @@ rl_policy 包内的 ROS1 多机状态管理节点。
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -94,26 +96,135 @@ class TargetState:
 
 
 class SwarmStateManager:
+    @staticmethod
+    def _is_auto_value(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("", "auto")
+        if isinstance(value, (list, tuple)):
+            return len(value) == 0 or (len(value) == 1 and SwarmStateManager._is_auto_value(value[0]))
+        return False
+
+    def _load_bundle_config(self) -> dict:
+        if self.bundle_dir is None:
+            return {}
+        config_path = self.bundle_dir / "policy_config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(f"[swarm_state_manager] Failed to load bundle config from {config_path}: {exc}") from exc
+        rospy.loginfo("[swarm_state_manager] Loaded bundle config: %s", str(config_path))
+        return cfg
+
+    def _bundle_get(self, *keys, default=None):
+        cur = self.bundle_cfg
+        for key in keys:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    def _bundle_friend_count(self, default=None):
+        possible_agents = self.bundle_cfg.get("possible_agents", [])
+        if isinstance(possible_agents, list) and len(possible_agents) > 0:
+            return int(len(possible_agents))
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("friendly_size", "num_drones", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    n = int(value)
+                    if n > 0:
+                        return n
+        return default
+
+    def _bundle_enemy_count(self, default=None):
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("enemy_size", "target_size", "num_targets", "num_enemies"):
+                value = counts.get(key)
+                if value is not None:
+                    n = int(value)
+                    if n > 0:
+                        return n
+        policy_targets = self._bundle_get("policy", "kwargs", "num_targets", default=None)
+        if policy_targets is not None:
+            n = int(policy_targets)
+            if n > 0:
+                return n
+        return default
+
+    def _topic_list_param(self, ros_name: str, count, factory, default_topics, label: str) -> list[str]:
+        value = rospy.get_param(f"~{ros_name}", "auto" if count is not None else list(default_topics))
+        if self._is_auto_value(value):
+            if count is None:
+                return list(default_topics)
+            return [factory(i) for i in range(int(count))]
+        if isinstance(value, str):
+            value = [value]
+        value = [str(x) for x in list(value)]
+        if count is not None and len(value) != int(count):
+            raise ValueError(
+                f"{label} length ({len(value)}) must equal bundle-derived count ({int(count)}). "
+                f"Set ~{ros_name}: auto or remove it to generate topics automatically."
+            )
+        if len(value) == 0:
+            raise ValueError(f"{label} cannot be empty")
+        return value
+
+    def _read_observation_int(self, ros_name: str, default: int) -> int:
+        return int(self._bundle_get("observation", ros_name, default=rospy.get_param(f"~{ros_name}", default)))
+
+    def _read_gimbal_float(self, ros_name: str, default: float, bundle_name: str | None = None) -> float:
+        key = bundle_name or ros_name
+        return float(self._bundle_get("environment", "sensors", "gimbal", key, default=rospy.get_param(f"~{ros_name}", default)))
+
+    def _read_hit_radius(self, default: float) -> float:
+        return float(self._bundle_get(
+            "environment", "target_motion", "hit_and_lifecycle", "hit_radius",
+            default=rospy.get_param("~hit_radius", default),
+        ))
+
     def __init__(self) -> None:
+        self.bundle_dir_param = str(rospy.get_param("~bundle_dir", "")).strip()
+        self.bundle_dir = Path(self.bundle_dir_param).resolve() if self.bundle_dir_param else None
+        self.bundle_cfg = self._load_bundle_config()
+
         self.publish_hz = float(rospy.get_param("~publish_hz", 50.0))               # 状态管理节点每秒更新并往外发多少次观测/状态。
         self.input_timeout_sec = float(rospy.get_param("~input_timeout_sec", 0.5))  # “输入消息多久不更新，就判定这路状态失效”的阈值
         self.target_wait_log_period_sec = float(rospy.get_param("~target_wait_log_period_sec", 3.0))
         self.observation_status_log_period_sec = float(rospy.get_param("~observation_status_log_period_sec", 3.0))
         self.world_origin_xyz = np.asarray(rospy.get_param("~world_origin_xyz", [0.0, 0.0, 0.0]), dtype=np.float32)
 
-        self.friend_odom_topics = list(rospy.get_param("~friend_odom_topics", ["/uav0/odom"]))
-        self.enemy_odom_topics = list(rospy.get_param("~enemy_odom_topics", ["/enemy0/odom"]))
+        friend_count = self._bundle_friend_count(default=None)
+        enemy_count = self._bundle_enemy_count(default=None)
+        self.friend_odom_topics = self._topic_list_param(
+            "friend_odom_topics",
+            friend_count,
+            lambda i: f"/uav{i}/odom",
+            ["/uav0/odom"],
+            "friend_odom_topics",
+        )
+        self.enemy_odom_topics = self._topic_list_param(
+            "enemy_odom_topics",
+            enemy_count,
+            lambda i: f"/enemy{i}/odom",
+            ["/enemy0/odom"],
+            "enemy_odom_topics",
+        )
         self.enemy_exists_topic = rospy.get_param("~enemy_exists_topic", "/enemy_target_manager/enemy_exists")
         self.enemy_frozen_topic = rospy.get_param("~enemy_frozen_topic", "/enemy_target_manager/enemy_frozen")
 
-        self.obs_k_friends = int(rospy.get_param("~obs_k_friends", 2))
-        self.obs_k_target = int(rospy.get_param("~obs_k_target", 3))
-        self.obs_k_friend_targetpos = int(rospy.get_param("~obs_k_friend_targetpos", 3))
+        self.obs_k_friends = self._read_observation_int("obs_k_friends", 2)
+        self.obs_k_target = self._read_observation_int("obs_k_target", 3)
+        self.obs_k_friend_targetpos = self._read_observation_int("obs_k_friend_targetpos", 3)
 
-        self.fov_horizontal_deg = float(rospy.get_param("~fov_horizontal_deg", 60.0))
-        self.fov_vertical_deg = float(rospy.get_param("~fov_vertical_deg", 45.0))
-        self.max_visible_distance = float(rospy.get_param("~max_visible_distance", 6.0))
-        self.hit_radius = float(rospy.get_param("~hit_radius", 0.3))
+        self.fov_horizontal_deg = self._read_gimbal_float("fov_horizontal_deg", 60.0, "gimbal_fov_h_deg")
+        self.fov_vertical_deg = self._read_gimbal_float("fov_vertical_deg", 45.0, "gimbal_fov_v_deg")
+        self.max_visible_distance = self._read_gimbal_float("max_visible_distance", 6.0, "gimbal_effective_range")
+        self.hit_radius = self._read_hit_radius(0.3)
 
         self.friendly_states_topic = rospy.get_param("~friendly_states_topic", "~friendly_states")
         self.target_states_topic = rospy.get_param("~target_states_topic", "~target_states")
@@ -127,6 +238,14 @@ class SwarmStateManager:
             raise ValueError("friend_odom_topics cannot be empty")
         if self.num_targets <= 0:
             raise ValueError("enemy_odom_topics cannot be empty")
+
+        bundle_obs_dim = self._bundle_get("observation", "single_observation_dim", default=None)
+        if bundle_obs_dim is not None and int(bundle_obs_dim) != int(self.obs_dim):
+            raise ValueError(
+                f"[swarm_state_manager] Computed obs_dim={self.obs_dim} does not match "
+                f"bundle observation.single_observation_dim={int(bundle_obs_dim)}. "
+                "Check obs_k_friends / obs_k_target / obs_k_friend_targetpos."
+            )
 
         self.friends: Dict[int, FriendlyState] = {
             i: FriendlyState(
@@ -183,7 +302,8 @@ class SwarmStateManager:
         self.enemy_frozen_sub = rospy.Subscriber(self.enemy_frozen_topic, UInt8MultiArray, self._enemy_frozen_cb, queue_size=1)
 
         rospy.loginfo(
-            "swarm_state_manager ready: friendly=%d targets=%d obs_dim=%d",
+            "swarm_state_manager ready: bundle_dir=%s friendly=%d targets=%d obs_dim=%d",
+            str(self.bundle_dir) if self.bundle_dir is not None else "",
             self.num_friendly,
             self.num_targets,
             self.obs_dim,
@@ -191,6 +311,11 @@ class SwarmStateManager:
         rospy.loginfo("friend_odom_topics=%s", self.friend_odom_topics)
         rospy.loginfo("enemy_odom_topics=%s", self.enemy_odom_topics)
         rospy.loginfo("enemy_exists_topic=%s enemy_frozen_topic=%s", self.enemy_exists_topic, self.enemy_frozen_topic)
+        rospy.loginfo(
+            "observation/sensor config: obs_k_friends=%d obs_k_target=%d obs_k_friend_targetpos=%d fov_h=%.3f fov_v=%.3f range=%.3f hit_radius=%.3f",
+            self.obs_k_friends, self.obs_k_target, self.obs_k_friend_targetpos,
+            self.fov_horizontal_deg, self.fov_vertical_deg, self.max_visible_distance, self.hit_radius,
+        )
         rospy.loginfo("target generator is not launched by swarm_policy_deploy.launch; start it separately with: roslaunch rl_policy spawn_targets.launch")
 
     @property

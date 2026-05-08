@@ -24,8 +24,10 @@ Designed to pair with the previously generated ROS1 policy / hit-detection nodes
 
 from __future__ import annotations
 
+import json
 import math
 import random
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
@@ -59,32 +61,347 @@ class EnemyState:
 
 
 class EnemyTargetManager:
+    def _load_bundle_config(self) -> dict:
+        if not self.bundle_dir:
+            raise RuntimeError("[enemy_target_manager] ~bundle_dir is required; target motion/spawn config is read only from bundle_dir/policy_config.json")
+
+        config_path = self.bundle_dir / "policy_config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(f"[enemy_target_manager] Failed to load bundle config from {config_path}: {exc}") from exc
+
+        target_motion = cfg.get("environment", {}).get("target_motion", None)
+        if not isinstance(target_motion, dict):
+            raise RuntimeError(
+                f"[enemy_target_manager] Missing environment.target_motion in {config_path}. "
+                "Please re-export the policy bundle with the updated export script."
+            )
+
+        rospy.loginfo("[enemy_target_manager] Loaded bundle target config: %s", str(config_path))
+        return cfg
+
+    def _bundle_get(self, *keys, default=None):
+        cur = self.bundle_cfg
+        for key in keys:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    def _bundle_friend_count(self) -> int:
+        possible_agents = self.bundle_cfg.get("possible_agents", [])
+        if isinstance(possible_agents, list) and len(possible_agents) > 0:
+            return int(len(possible_agents))
+
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("friendly_size", "num_drones", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    return int(value)
+
+        raise RuntimeError(
+            "[enemy_target_manager] policy_config.json does not contain possible_agents or a friendly count. "
+            "Please re-export the bundle with the updated export script."
+        )
+
+    def _bundle_enemy_count(self) -> int:
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("enemy_size", "target_size", "num_targets", "num_enemies", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    n = int(value)
+                    if n <= 0:
+                        raise RuntimeError(f"[enemy_target_manager] Invalid {key}={value} in policy_config.json")
+                    return n
+
+        raise RuntimeError(
+            "[enemy_target_manager] policy_config.json does not contain "
+            "environment.target_motion.counts.enemy_size / target_size / num_targets. "
+            "Please re-export the bundle with the updated export script."
+        )
+
+    @staticmethod
+    def _is_auto_value(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("", "auto")
+        if isinstance(value, (list, tuple)):
+            return len(value) == 0 or (len(value) == 1 and EnemyTargetManager._is_auto_value(value[0]))
+        return False
+
+    def _topic_list_param(self, ros_name: str, count: int, factory, label: str) -> list[str]:
+        value = rospy.get_param(f"~{ros_name}", "auto")
+        if self._is_auto_value(value):
+            return [factory(i) for i in range(count)]
+        if isinstance(value, str):
+            value = [value]
+        value = [str(x) for x in list(value)]
+        if len(value) != count:
+            raise ValueError(
+                f"{label} length ({len(value)}) must equal bundle-derived count ({count}). "
+                f"Set ~{ros_name}: auto or remove it to generate topics automatically."
+            )
+        return value
+
+    @staticmethod
+    def _xy_array(value, default, label: str) -> np.ndarray:
+        if EnemyTargetManager._is_auto_value(value):
+            value = default
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        if arr.size < 2:
+            raise ValueError(f"{label} must contain at least two numeric values [x, y], got {value!r}")
+        if not np.isfinite(arr[:2]).all():
+            raise ValueError(f"{label} must be finite [x, y], got {value!r}")
+        return arr[:2].astype(np.float32)
+
+    def _requires_prestart_gate(self) -> bool:
+        return bool(
+            self.require_friend_yaw_aligned
+            or self.require_friend_formation_aligned
+            or self.require_friend_velocity_aligned
+        )
+
+    def _target_bundle_get(self, group: str, name: str, default=None):
+        return self._bundle_get("environment", "target_motion", group, name, default=default)
+
+    def _sensor_bundle_get(self, group: str, name: str, default=None):
+        return self._bundle_get("environment", "sensors", group, name, default=default)
+
+    def _read_target_value(self, ros_name: str, default, group: str, bundle_name: str | None = None):
+        """Read target/enemy config with this priority:
+
+        1) bundle_dir/policy_config.json: environment.target_motion.<group>.<key>
+        2) ROS/YAML private parameter: ~<ros_name>
+        3) code default
+
+        This keeps a single YAML usable across 1v1/2v2/3v3 bundles while still
+        allowing old bundles to run if a field has not been exported yet.
+        Formation selection is intentionally handled separately by YAML.
+        """
+        key = bundle_name or ros_name
+        value = self._target_bundle_get(group, key, default=None)
+        if value is not None:
+            return value
+        return rospy.get_param(f"~{ros_name}", default)
+
+    def _read_target_float(self, ros_name: str, default: float, group: str, bundle_name: str | None = None) -> float:
+        return float(self._read_target_value(ros_name, default, group, bundle_name))
+
+    def _read_target_int(self, ros_name: str, default: int, group: str, bundle_name: str | None = None) -> int:
+        return int(self._read_target_value(ros_name, default, group, bundle_name))
+
+    def _read_target_str(self, ros_name: str, default: str, group: str, bundle_name: str | None = None) -> str:
+        return str(self._read_target_value(ros_name, default, group, bundle_name))
+
+    def _read_target_list(self, ros_name: str, default, group: str, bundle_name: str | None = None):
+        value = self._read_target_value(ros_name, default, group, bundle_name)
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    @staticmethod
+    def _normalize_formation_name(name: str) -> str:
+        return str(name).strip().lower().replace("-", "_").replace(" ", "")
+
+    def _formation_type_from_bundle(self) -> Optional[str]:
+        # Isaac env template ids:
+        #   0 v_wedge_2d, 1 rect2d, 2 square2d, 3 rect3d, 4 cube3d, 5 poisson3d,
+        #   6 circle2d, 7 line2d, 8 cross2d5, 9 pyramid3d5, 10 echelon_2d
+        id_to_ros = {
+            0: "v_wedge_2d",
+            1: "rect2d",
+            2: "rect2d",
+            3: "random_disk",
+            4: "random_disk",
+            5: "random_disk",
+            6: "circle2d",
+            7: "line2d",
+            8: "random_disk",
+            9: "random_disk",
+            10: "echelon_2d",
+        }
+        name_map = {
+            "v_wedge_2d": "v_wedge_2d",
+            "rect2d": "rect2d",
+            "square2d": "rect2d",
+            "rect3d": "random_disk",
+            "cube3d": "random_disk",
+            "poisson3d": "random_disk",
+            "circle2d": "circle2d",
+            "line2d": "line2d",
+            "cross2d5": "random_disk",
+            "pyramid3d5": "random_disk",
+            "echelon_2d": "echelon_2d",
+        }
+
+        ids = self._target_bundle_get("formation", "enemy_formation_template_ids", default=None)
+        names = self._target_bundle_get("formation", "enemy_formation_templates", default=None)
+
+        candidates = []
+        if ids is not None:
+            if not isinstance(ids, (list, tuple)):
+                ids = [ids]
+            for item in ids:
+                try:
+                    mapped = id_to_ros.get(int(item))
+                except Exception:
+                    mapped = None
+                if mapped is not None:
+                    candidates.append(mapped)
+        elif names is not None:
+            if isinstance(names, str):
+                names = [names]
+            for item in names:
+                key = self._normalize_formation_name(item)
+                if key in ("all", "*"):
+                    return "random"
+                mapped = name_map.get(key)
+                if mapped is not None:
+                    candidates.append(mapped)
+
+        candidates = sorted(set(candidates))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            return "random"
+        return None
+
+
+    def _formation_type_from_yaml(self) -> tuple[Optional[str], str]:
+        """Read deployment formation selection from ROS/YAML.
+
+        Priority:
+          1) ~formation_type when set to a concrete name.
+          2) ~formation_id when set to a concrete id.
+          3) None, meaning fall back to bundle formation templates.
+
+        Accepted formation_type values:
+          random, line2d, circle2d, v_wedge_2d, rect2d, echelon_2d, random_disk
+        Accepted formation_id values:
+          0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
+        """
+        formation_type_param = rospy.get_param("~formation_type", "auto")
+        if not self._is_auto_value(formation_type_param):
+            name = self._normalize_formation_name(str(formation_type_param))
+            alias_map = {
+                "random": "random",
+                "line": "line2d",
+                "line2d": "line2d",
+                "circle": "circle2d",
+                "circle2d": "circle2d",
+                "v": "v_wedge_2d",
+                "wedge": "v_wedge_2d",
+                "vwedge": "v_wedge_2d",
+                "vwedge2d": "v_wedge_2d",
+                "v_wedge": "v_wedge_2d",
+                "v_wedge_2d": "v_wedge_2d",
+                "rect": "rect2d",
+                "rectangle": "rect2d",
+                "rect2d": "rect2d",
+                "echelon": "echelon_2d",
+                "echelon2d": "echelon_2d",
+                "echelon_2d": "echelon_2d",
+                "disk": "random_disk",
+                "randomdisk": "random_disk",
+                "random_disk": "random_disk",
+            }
+            if name not in alias_map:
+                raise ValueError(
+                    "~formation_type must be one of "
+                    "random, line2d, circle2d, v_wedge_2d, rect2d, echelon_2d, random_disk, "
+                    f"got {formation_type_param!r}"
+                )
+            return alias_map[name], "yaml:formation_type"
+
+        formation_id_param = rospy.get_param("~formation_id", "auto")
+        if not self._is_auto_value(formation_id_param):
+            try:
+                fid = int(formation_id_param)
+            except Exception as exc:
+                raise ValueError(f"~formation_id must be an integer id or 'auto', got {formation_id_param!r}") from exc
+            mapped = self.formation_id_map.get(fid)
+            if mapped is None:
+                raise ValueError(
+                    "~formation_id must be one of 0=random, 1=line2d, 2=circle2d, "
+                    "3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk, "
+                    f"got {formation_id_param!r}"
+                )
+            self.formation_id = fid
+            return mapped, "yaml:formation_id"
+
+        return None, "bundle"
+
+    def _select_formation_type(self) -> tuple[str, str]:
+        yaml_formation, source = self._formation_type_from_yaml()
+        if yaml_formation is not None:
+            return yaml_formation, source
+        bundle_formation = self._formation_type_from_bundle()
+        if bundle_formation is not None:
+            return bundle_formation, "bundle"
+        return "random", "default:random"
+
     def __init__(self) -> None:
+        # ----------------------- exported bundle config -----------------------
+        # Target/enemy motion and spawn config are read strictly from bundle_dir/policy_config.json.
+        # YAML remains responsible only for ROS wiring and deployment-only behavior.
+        self.bundle_dir_param = str(rospy.get_param("~bundle_dir", "")).strip()
+        self.bundle_dir = Path(self.bundle_dir_param).resolve() if self.bundle_dir_param else None
+        self.bundle_cfg = self._load_bundle_config()
+
         # ----------------------------- basic -----------------------------
         self.frame_id = rospy.get_param("~frame_id", "map")
         self.publish_rate = float(rospy.get_param("~publish_rate", 30.0))
-        self.enemy_size = int(rospy.get_param("~enemy_size", 3))
-        self.friend_odom_topics = list(rospy.get_param("~friend_odom_topics", []))
-        self.enemy_odom_topics = list(rospy.get_param("~enemy_odom_topics", [f"~enemy_{i}/odom" for i in range(self.enemy_size)]))
-        if len(self.enemy_odom_topics) != self.enemy_size:
-            raise ValueError(f"enemy_odom_topics length ({len(self.enemy_odom_topics)}) must equal enemy_size ({self.enemy_size})")
+
+        # Friend/target counts are part of the exported training/deployment bundle.
+        self.friend_size = self._bundle_friend_count()
+        self.enemy_size = self._bundle_enemy_count()
+
+        self.friend_odom_topics = self._topic_list_param(
+            "friend_odom_topics",
+            self.friend_size,
+            lambda i: f"/uav{i}/odom",
+            "friend_odom_topics",
+        )
+        self.enemy_odom_topics = self._topic_list_param(
+            "enemy_odom_topics",
+            self.enemy_size,
+            lambda i: f"/enemy{i}/odom",
+            "enemy_odom_topics",
+        )
 
         # ----------------------------- motion ----------------------------
-        self.enemy_speed = float(rospy.get_param("~enemy_speed", 2.3))
-        self.enemy_motion_mode = str(rospy.get_param("~enemy_motion_mode", "force_field")).lower()
-        self.enemy_goal_radius = float(rospy.get_param("~enemy_goal_radius", 0.1))
-        self.goal_xyz = np.asarray(rospy.get_param("~goal_xyz", [0.0, 0.0, 1.0]), dtype=np.float32)
+        self.enemy_speed = self._read_target_float("enemy_speed", 2.3, "motion")
+        self.enemy_motion_mode = self._read_target_str("enemy_motion_mode", "force_field", "motion").lower()
+        self.enemy_goal_radius = self._read_target_float("enemy_goal_radius", 0.1, "motion")
+        self.enemy_target_alt = self._read_target_float("enemy_target_alt", 1.0, "motion")
+        # goal z / target altitude is bundle-owned. YAML may only provide world-frame goal_xy
+        # for deployment coordinate placement; legacy goal_xyz z is ignored if present.
+        goal_xy_param = rospy.get_param("~goal_xy", None)
+        if goal_xy_param is None:
+            legacy_goal_xyz = rospy.get_param("~goal_xyz", None)
+            goal_xy_param = legacy_goal_xyz[:2] if legacy_goal_xyz is not None else [0.0, 0.0]
+        goal_xy = self._xy_array(goal_xy_param, [0.0, 0.0], "~goal_xy")
+        self.goal_xyz = np.asarray([float(goal_xy[0]), float(goal_xy[1]), self.enemy_target_alt], dtype=np.float32)
 
-        self.enemy_goal_attraction_weight = float(rospy.get_param("~enemy_goal_attraction_weight", 3.0))
-        self.enemy_pursuer_repulsion_weight = float(rospy.get_param("~enemy_pursuer_repulsion_weight", 1.5))
-        self.enemy_pursuer_repulsion_range = float(rospy.get_param("~enemy_pursuer_repulsion_range", 40.0))
-        self.enemy_pursuer_repulsion_smooth = float(rospy.get_param("~enemy_pursuer_repulsion_smooth", 1.0))
-        self.enemy_pursuer_repulsion_max = float(rospy.get_param("~enemy_pursuer_repulsion_max", 2.0))
-        self.enemy_separation_weight = float(rospy.get_param("~enemy_separation_weight", 0.2))
-        self.enemy_separation_range = float(rospy.get_param("~enemy_separation_range", 1.5))
-        self.enemy_cohesion_weight = float(rospy.get_param("~enemy_cohesion_weight", 0.2))
-        self.enemy_cohesion_range = float(rospy.get_param("~enemy_cohesion_range", 5.0))
-        self.enemy_evasive_eps = float(rospy.get_param("~enemy_evasive_eps", 1e-6))
+        self.enemy_goal_attraction_weight = self._read_target_float("enemy_goal_attraction_weight", 3.0, "force_field")
+        self.enemy_pursuer_repulsion_weight = self._read_target_float("enemy_pursuer_repulsion_weight", 1.5, "force_field")
+        self.enemy_pursuer_repulsion_range = self._read_target_float("enemy_pursuer_repulsion_range", 40.0, "force_field")
+        self.enemy_pursuer_repulsion_smooth = self._read_target_float("enemy_pursuer_repulsion_smooth", 1.0, "force_field")
+        self.enemy_pursuer_repulsion_max = self._read_target_float("enemy_pursuer_repulsion_max", 2.0, "force_field")
+        self.enemy_separation_weight = self._read_target_float("enemy_separation_weight", 0.2, "force_field")
+        self.enemy_separation_range = self._read_target_float("enemy_separation_range", 1.5, "force_field")
+        self.enemy_cohesion_weight = self._read_target_float("enemy_cohesion_weight", 0.2, "force_field")
+        self.enemy_cohesion_range = self._read_target_float("enemy_cohesion_range", 5.0, "force_field")
+        self.enemy_evasive_eps = self._read_target_float("enemy_evasive_eps", 1e-6, "motion")
 
         # ----------------------------- spawn -----------------------------
         self.spawn_on_start = bool(rospy.get_param("~spawn_on_start", True))
@@ -98,20 +415,20 @@ class EnemyTargetManager:
             5: "echelon_2d",
             6: "random_disk",
         }
-        self.formation_id = int(rospy.get_param("~formation_id", -1))
-        formation_type_param = str(rospy.get_param("~formation_type", "random")).lower()
-        if self.formation_id in self.formation_id_map:
-            self.formation_type = self.formation_id_map[self.formation_id]
-        else:
-            self.formation_type = formation_type_param
-        self.enemy_cluster_ring_radius = float(rospy.get_param("~enemy_cluster_ring_radius", 5.0))
+        # Formation selection is deployment-owned by YAML when ~formation_type or ~formation_id is set.
+        # Use "auto" or omit both params to fall back to bundle formation templates.
+        self.formation_id = -1
+        self.formation_type, self.formation_source = self._select_formation_type()
+        self.enemy_cluster_ring_radius = self._read_target_float("enemy_cluster_ring_radius", 5.0, "spawn")
         spawn_center_xy_param = rospy.get_param("~spawn_center_xy", None)
-        self.spawn_center_xy = None if spawn_center_xy_param is None else np.asarray(spawn_center_xy_param, dtype=np.float32)
-        self.enemy_cluster_radius = float(rospy.get_param("~enemy_cluster_radius", 1.0))
-        self.enemy_height_min = float(rospy.get_param("~enemy_height_min", 1.0))
-        self.enemy_height_max = float(rospy.get_param("~enemy_height_max", 1.0))
-        self.enemy_min_separation_min = float(rospy.get_param("~enemy_min_separation_min", 1.0))
-        self.enemy_min_separation_max = float(rospy.get_param("~enemy_min_separation_max", 2.0))
+        self.spawn_center_xy = None if self._is_auto_value(spawn_center_xy_param) else self._xy_array(spawn_center_xy_param, [0.0, 0.0], "~spawn_center_xy")
+        self.enemy_cluster_radius = self._read_target_float("enemy_cluster_radius", 1.0, "spawn")
+        self.enemy_height_min = self._read_target_float("enemy_height_min", 1.0, "spawn")
+        self.enemy_height_max = self._read_target_float("enemy_height_max", 1.0, "spawn")
+        sep_default = self._read_target_float("enemy_min_separation", 1.0, "spawn")
+        self.enemy_min_separation_min = self._read_target_float("enemy_min_separation_min", sep_default, "spawn")
+        self.enemy_min_separation_max = self._read_target_float("enemy_min_separation_max", self.enemy_min_separation_min, "spawn")
+        self.enemy_vertical_separation = self._read_target_float("enemy_vertical_separation", self.enemy_min_separation_min, "spawn")
         self.random_seed = int(rospy.get_param("~random_seed", 0))
         self.fixed_spawn_theta_deg = float(rospy.get_param("~fixed_spawn_theta_deg", -9999.0))
 
@@ -122,9 +439,7 @@ class EnemyTargetManager:
         #     while preserving its distance to goal_xyz.
         self.spawn_mode = str(rospy.get_param("~spawn_mode", "legacy")).lower()
         arena_center_xy_param = rospy.get_param("~arena_center_xy", [0.0, 0.0])
-        self.arena_center_xy = np.asarray(arena_center_xy_param, dtype=np.float32)
-        if self.arena_center_xy.shape[0] != 2:
-            raise ValueError("~arena_center_xy must have exactly 2 elements: [x, y]")
+        self.arena_center_xy = self._xy_array(arena_center_xy_param, [0.0, 0.0], "~arena_center_xy")
         self.arena_radius = float(rospy.get_param("~arena_radius", 6.0))
         self.arena_margin = float(rospy.get_param("~arena_margin", 0.0))
         self.arena_include_enemy_cluster_radius = bool(rospy.get_param("~arena_include_enemy_cluster_radius", True))
@@ -149,10 +464,12 @@ class EnemyTargetManager:
         # After all friendly UAVs face the target cluster center, keep holding
         # yaw alignment for this many seconds before releasing enemy odometry/motion.
         self.yaw_align_release_delay_sec = float(rospy.get_param("~yaw_align_release_delay_sec", 0.0))
-        self.yaw_align_command_topics = list(rospy.get_param(
-            "~yaw_align_command_topics",
-            [f"/uav{i}/position_cmd" for i in range(len(self.friend_odom_topics))],
-        ))
+        self.yaw_align_command_topics = self._topic_list_param(
+            "yaw_align_command_topics",
+            self.friend_size,
+            lambda i: f"/uav{i}/position_cmd",
+            "yaw_align_command_topics",
+        )
         self.yaw_align_kx = rospy.get_param("~yaw_align_kx", [0.0, 0.0, 0.0])
         self.yaw_align_kv = rospy.get_param("~yaw_align_kv", [0.0, 0.0, 0.0])
 
@@ -173,9 +490,11 @@ class EnemyTargetManager:
         self.friend_formation_velocity_tolerance = float(rospy.get_param("~friend_formation_velocity_tolerance", 0.25))
         self.require_friend_velocity_aligned = bool(rospy.get_param("~require_friend_velocity_aligned", False))
         friend_formation_anchor_xy_param = rospy.get_param("~friend_formation_anchor_xy", None)
-        self.friend_formation_anchor_xy = None if friend_formation_anchor_xy_param is None else np.asarray(friend_formation_anchor_xy_param, dtype=np.float32)
-        if self.friend_formation_anchor_xy is not None and self.friend_formation_anchor_xy.shape[0] != 2:
-            raise ValueError("~friend_formation_anchor_xy must have exactly 2 elements: [x, y]")
+        self.friend_formation_anchor_xy = (
+            None
+            if self._is_auto_value(friend_formation_anchor_xy_param)
+            else self._xy_array(friend_formation_anchor_xy_param, [0.0, 0.0], "~friend_formation_anchor_xy")
+        )
         # Gains written into PositionCommand for downstream controllers that use msg.kx/msg.kv.
         # If your PX4 controller ignores these fields, it will still receive position/yaw setpoints.
         self.friend_formation_kx = rospy.get_param("~friend_formation_kx", [1.5, 1.5, 1.5])
@@ -224,7 +543,7 @@ class EnemyTargetManager:
         self._last_time: Optional[rospy.Time] = None
         self._spawn_pending = False
         self._enemies_spawned = False
-        self._motion_released = not self.require_friend_yaw_aligned
+        self._motion_released = not self._requires_prestart_gate()
         self._yaw_aligned_since: Optional[rospy.Time] = None
         self._spawn_center_xy: Optional[np.ndarray] = None
         self._friend_formation_targets: Optional[np.ndarray] = None  # [M,3], world-frame desired pre-start positions
@@ -280,12 +599,33 @@ class EnemyTargetManager:
         self.timer = rospy.Timer(rospy.Duration.from_sec(1.0 / max(self.publish_rate, 1e-3)), self._timer_cb)
 
         rospy.loginfo("Enemy target manager ready")
-        rospy.loginfo("enemy_size=%d motion_mode=%s formation_type=%s formation_id=%d", self.enemy_size, self.enemy_motion_mode, self.formation_type, self.formation_id)
+        rospy.loginfo(
+            "bundle_dir=%s target_motion_source=policy_config.json target_motion_loaded=%s",
+            str(self.bundle_dir) if self.bundle_dir is not None else "",
+            bool(self._bundle_get("environment", "target_motion", default=None)),
+        )
+        rospy.loginfo("friend_size=%d enemy_size=%d motion_mode=%s formation_type=%s formation_id=%d formation_source=%s", self.friend_size, self.enemy_size, self.enemy_motion_mode, self.formation_type, self.formation_id, self.formation_source)
         rospy.loginfo("available formation_type: %s", ["random"] + self.available_formations)
         rospy.loginfo("formation_id map: %s", self.formation_id_map)
         rospy.loginfo("friend_odom_topics=%s", self.friend_odom_topics)
         rospy.loginfo("enemy_odom_topics=%s", self.enemy_odom_topics)
         rospy.loginfo("goal_xyz=%s", self.goal_xyz.tolist())
+        rospy.loginfo(
+            "target motion config: mode=%s speed=%.3f goal_radius=%.3f target_alt=%.3f force_field=[goal=%.3f pursuer=%.3f range=%.3f smooth=%.3f max=%.3f sep=%.3f/%.3f coh=%.3f/%.3f]",
+            self.enemy_motion_mode,
+            self.enemy_speed,
+            self.enemy_goal_radius,
+            self.enemy_target_alt,
+            self.enemy_goal_attraction_weight,
+            self.enemy_pursuer_repulsion_weight,
+            self.enemy_pursuer_repulsion_range,
+            self.enemy_pursuer_repulsion_smooth,
+            self.enemy_pursuer_repulsion_max,
+            self.enemy_separation_weight,
+            self.enemy_separation_range,
+            self.enemy_cohesion_weight,
+            self.enemy_cohesion_range,
+        )
         rospy.loginfo(
             "require_friend_yaw_aligned=%s yaw_align_tolerance_deg=%.3f yaw_align_release_delay_sec=%.3f yaw_align_command_topics=%s",
             self.require_friend_yaw_aligned,
@@ -383,7 +723,7 @@ class EnemyTargetManager:
     def spawn_enemies(self) -> None:
         self._spawn_pending = False
         self._enemies_spawned = False
-        self._motion_released = not self.require_friend_yaw_aligned
+        self._motion_released = not self._requires_prestart_gate()
         self._yaw_aligned_since = None
         self._friend_formation_targets = None
         self._episode_terminated = False

@@ -11,7 +11,7 @@
     the target generator while keeping the fake odom node alive.
   -->
 
-  <arg name="params_file" default="$(find policy_test)/config/deployment_params_test_3.yaml"/>
+  <arg name="params_file" default="$(find policy_test)/config/deployment_params_target_auto.yaml"/>
   <arg name="target_node_name" default="enemy_target_manager"/>
   <arg name="target_node_type" default="spawn_targets_node_test.py"/>
   <arg name="use_python3_prefix" default="false"/>

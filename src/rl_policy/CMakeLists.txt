@@ -162,10 +162,10 @@ include_directories(
 ## Mark executable scripts (Python etc.) for installation
 ## in contrast to setup.py, you can choose the destination
 catkin_install_python(PROGRAMS
-  src/spawn_targets_node.py
-  src/swarm_state_manager.py
-  src/policy_control_node.py
-  src/policy_cmd_bridge.py
+  scripts/spawn_targets_node.py
+  scripts/policy_control_node.py
+  scripts/policy_cmd_bridge.py
+  scripts/swarm_state_manager.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -1,0 +1,52 @@
+odom_bridge:
+  num_uavs: 3
+  world_frame_id: world
+  publish_tf: true
+
+  # FAST-LIO raw local odometry topics. Each UAV starts near its own local origin.
+  input_odom_topics:
+    - /uav0/odom_raw
+    - /uav1/odom_raw
+    - /uav2/odom_raw
+
+  # Unified world-frame odometry topics for policy/RViz.
+  output_odom_topics:
+    - /uav0/odom
+    - /uav1/odom
+    - /uav2/odom
+
+  child_frame_ids:
+    - uav0/base_link
+    - uav1/base_link
+    - uav2/base_link
+
+  # FAST-LIO local origin position in the unified world frame.
+  # Change these to your real measured takeoff/initial positions.
+  world_xyz_offsets:
+    - [0.0,  0.0, 0.0]
+    - [0.0, -1.0, 0.0]
+    - [0.0,  1.0, 0.0]
+
+  # Local FAST-LIO x-axis yaw relative to world x-axis.
+  # If all UAVs are placed with the same heading as world +X, keep all 0.
+  world_yaw_offsets_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+
+  # The bridge transforms all odometry fields used by the policy stack:
+  #   position          -> rotated + translated into world
+  #   orientation       -> yaw-offset quaternion applied
+  #   linear velocity   -> rotated into world
+  #   angular velocity  -> rotated into world
+
+  # Usually true is fine.  Policy nodes ignore covariance, but keeping it helps RViz/debugging.
+  copy_raw_covariance: true
+
+  # If covariance is copied, rotate the 6x6 pose/twist covariance by the same yaw offset.
+  # Keep true unless you know the raw FAST-LIO covariance is already expressed in the output frame.
+  rotate_covariance: true
+
+  # Normally false.  Set true only if your raw odom z already includes the desired world altitude
+  # and you do not want world_xyz_offsets[i][2] added to z.
+  zero_z_offset_from_raw: false

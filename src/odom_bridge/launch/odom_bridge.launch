@@ -1,0 +1,10 @@
+<launch>
+  <arg name="config_file" default="$(find odom_bridge)/config/odom_bridge.yaml" />
+
+  <rosparam command="load" file="$(arg config_file)" />
+
+  <node pkg="odom_bridge"
+        type="odom_bridge.py"
+        name="odom_bridge"
+        output="screen" />
+</launch>

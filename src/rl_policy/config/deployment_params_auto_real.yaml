@@ -38,7 +38,11 @@ policy_cmd_bridge:
   num_agents: auto
   policy_command_topics: auto
   odom_topics: auto
-  px4_command_topics: auto
+  # px4_command_topics: auto
+  px4_command_topics:
+    - /uav0/position_cmd_world
+    - /uav1/position_cmd_world
+    - /uav2/position_cmd_world
 
   publish_hz: 50.0
   command_frame_id: world
@@ -70,7 +74,11 @@ enemy_target_manager:
   #   enemy_odom_topics  -> /enemy0/odom ... /enemy{E-1}/odom
   friend_odom_topics: auto
   enemy_odom_topics: auto
-  yaw_align_command_topics: auto
+  # yaw_align_command_topics: auto
+  yaw_align_command_topics:
+    - /uav0/position_cmd_world
+    - /uav1/position_cmd_world
+    - /uav2/position_cmd_world
 
   # Feedback topics from swarm_state_manager.
   friendly_states_topic: /swarm_state_manager/friendly_states
@@ -89,15 +97,16 @@ enemy_target_manager:
   # Set both to auto to infer from bundle formation templates.
   formation_type: auto
   formation_id: 0
-  random_seed: 117
+  random_seed: 69
 
   # Feasible spawn center selection inside spawn_mode=arena_constrained.
   # Options:
   #   front_best      : choose feasible center most aligned with friend yaw.
   #   random_feasible : randomly choose one feasible center.
   spawn_selection_mode: front_best
-  # fixed_spawn_theta_deg: 0.0
-  fixed_spawn_theta_deg: -9999.0
+  fixed_spawn_theta_deg: 0.0
+  # fixed_spawn_theta_deg: -9999.0
+  # fixed_spawn_theta_deg: 30
 
   # Pre-start alignment gate.
   require_friend_yaw_aligned: true
@@ -168,52 +177,58 @@ enemy_target_manager:
   # enemy_min_separation_max: 2.0
 
 sim_friend_odom:
-  # Required by modified sim_friend_odom_node_auto_bundle.py.
-  # It reads policy_config.json and infers num_agents from possible_agents.
   bundle_dir: /home/wcw/interception_ws/src/rl_policy/policy
 
-  frame_id: world
+  # 这里表示 fake FAST-LIO raw odom 所在坐标系。
+  # 真实多机时每架 FAST-LIO 最好有自己的局部 frame；
+  # 但当前 sim_friend_odom_node.py 只有一个 frame_id 参数，
+  # 所以仿真里可以先统一写 odom_raw_local 或 world。
+  frame_id: odom_raw_local
+
   publish_rate: 200.0
   publish_marker: true
 
-  # Topic wiring. Use auto to generate from bundle-derived num_agents:
-  #   child_frame_ids       -> uav0, uav1, ...
-  #   odom_topics           -> /uav0/odom, /uav1/odom, ...
-  #   position_cmd_topics   -> /uav0/position_cmd, /uav1/position_cmd, ...
-  child_frame_ids: auto
-  odom_topics: auto
-  position_cmd_topics: auto
-  twist_cmd_topics: auto
+  child_frame_ids:
+    - uav0/base_link_raw
+    - uav1/base_link_raw
+    - uav2/base_link_raw
 
-  # Friendly UAV initial world poses.
-  # This is the world-origin version: positions are absolute world coordinates, not friend-centroid-relative.
-  # They match the RL reset-style formation for fixed_spawn_theta_deg=0.0.
+  # 关键修改：sim_friend_odom 不再直接发布 /uav{i}/odom，
+  # 而是模拟 FAST-LIO 原始局部 odom。
+  odom_topics:
+    - /uav0/odom_raw
+    - /uav1/odom_raw
+    - /uav2/odom_raw
+
+  # 控制命令仍然来自 policy_cmd_bridge。
+  # 注意：policy_cmd_bridge 应该订阅转换后的 /uav{i}/odom，
+  # 但发布控制命令到 /uav{i}/position_cmd。
+  position_cmd_topics:
+    - /uav0/position_cmd
+    - /uav1/position_cmd
+    - /uav2/position_cmd
+
+  twist_cmd_topics:
+    - /uav0/cmd_vel
+    - /uav1/cmd_vel
+    - /uav2/cmd_vel
+
+  # 用来模拟每架 FAST-LIO 自己的局部坐标。
+  # 三架机 raw 起点都在本机局部坐标 [0,0,1]。
   initial_positions:
     - [0.0, 0.0, 1.0]
-    - [0.0, -1.0, 1.0]
-    - [0.0, 1.0, 1.0]
-  initial_yaws_deg: [0.0, 11.309932474020213, -11.309932474020213]
-  initial_pitches_deg: [0.0, 0.0, 0.0]  # Control input source.
+    - [0.0, 0.0, 1.0]
+    - [0.0, 0.0, 1.0]
+
+  initial_yaws_deg: [0.0, 0.0, 0.0]
+  initial_pitches_deg: [0.0, 0.0, 0.0]
 
   control_mode: auto
   position_cmd_mode: direct_setpoint
+  # position_cmd_mode: track_position
   cmd_timeout_sec: 0.4
   no_cmd_behavior: hold
 
-  # Current exported policy_config.json normally does not contain min_z/max_z,
-  # so these remain deployment safety limits unless you add
-  # environment.friendly_dynamics.min_z/max_z to the JSON/export script.
-  min_z: 0.5
-  max_z: 2.5
+  min_z: 0.4
+  max_z: 2.0
   lock_z: false
-
-  # These four are now read from JSON action when present:
-  #   max_speed_xy <- action.v_max_xy
-  #   max_speed_z  <- action.v_max_z
-  #   max_accel    <- action.a_max
-  #   max_yaw_rate <- action.yaw_rate_max
-  # Keep them absent or auto unless using an old bundle.
-  # max_speed_xy: auto
-  # max_speed_z: auto
-  # max_accel: auto
-  # max_yaw_rate: auto

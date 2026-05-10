@@ -1,0 +1,9 @@
+<launch>
+  <arg name="params_file" default="$(find rl_policy)/config/position_cmd_frame_bridge.yaml" />
+  <rosparam command="load" file="$(arg params_file)" />
+
+  <node pkg="rl_policy"
+        type="position_cmd_frame_bridge.py"
+        name="position_cmd_frame_bridge"
+        output="screen" />
+</launch>

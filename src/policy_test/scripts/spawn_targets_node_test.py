@@ -1,0 +1,1939 @@
+#!/usr/bin/env python3
+"""
+ROS1 enemy/target manager for swarm interception deployment.
+
+This node:
+1) spawns and maintains enemy target states
+2) publishes per-enemy nav_msgs/Odometry topics (position + velocity)
+3) publishes RViz MarkerArray for visualization
+4) updates target motion using the same high-level logic as the Isaac Lab env:
+   - translate mode: fly directly toward goal
+   - force_field mode: goal attraction + pursuer repulsion + separation + cohesion
+5) can freeze targets when hit events are reported by friendly policy nodes
+
+Designed to pair with the previously generated ROS1 policy / hit-detection nodes.
+
+0 = random
+1 = line2d
+2 = circle2d
+3 = v_wedge_2d
+4 = rect2d
+5 = echelon_2d
+6 = random_disk
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+import rospy
+from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
+from nav_msgs.msg import Odometry
+from quadrotor_msgs.msg import PositionCommand
+from std_msgs.msg import Bool, Float32MultiArray, Int32MultiArray, String, UInt8MultiArray
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+def _wrap_pi(x: float) -> float:
+    return (x + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass
+class EntityState:
+    pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
+    vel: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
+    quat_wxyz: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    received: bool = False
+
+
+@dataclass
+class EnemyState:
+    pos: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
+    vel: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
+    exists: bool = False
+    frozen: bool = False
+
+
+class EnemyTargetManager:
+    def _load_bundle_config(self) -> dict:
+        if not self.bundle_dir:
+            raise RuntimeError("[enemy_target_manager] ~bundle_dir is required; target motion/spawn config is read only from bundle_dir/policy_config.json")
+
+        config_path = self.bundle_dir / "policy_config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(f"[enemy_target_manager] Failed to load bundle config from {config_path}: {exc}") from exc
+
+        target_motion = cfg.get("environment", {}).get("target_motion", None)
+        if not isinstance(target_motion, dict):
+            raise RuntimeError(
+                f"[enemy_target_manager] Missing environment.target_motion in {config_path}. "
+                "Please re-export the policy bundle with the updated export script."
+            )
+
+        rospy.loginfo("[enemy_target_manager] Loaded bundle target config: %s", str(config_path))
+        return cfg
+
+    def _bundle_get(self, *keys, default=None):
+        cur = self.bundle_cfg
+        for key in keys:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        return cur
+
+    def _bundle_friend_count(self) -> int:
+        possible_agents = self.bundle_cfg.get("possible_agents", [])
+        if isinstance(possible_agents, list) and len(possible_agents) > 0:
+            return int(len(possible_agents))
+
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("friendly_size", "num_drones", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    return int(value)
+
+        raise RuntimeError(
+            "[enemy_target_manager] policy_config.json does not contain possible_agents or a friendly count. "
+            "Please re-export the bundle with the updated export script."
+        )
+
+    def _bundle_enemy_count(self) -> int:
+        counts = self._bundle_get("environment", "target_motion", "counts", default={})
+        if isinstance(counts, dict):
+            for key in ("enemy_size", "target_size", "num_targets", "num_enemies", "swarm_size"):
+                value = counts.get(key)
+                if value is not None:
+                    n = int(value)
+                    if n <= 0:
+                        raise RuntimeError(f"[enemy_target_manager] Invalid {key}={value} in policy_config.json")
+                    return n
+
+        raise RuntimeError(
+            "[enemy_target_manager] policy_config.json does not contain "
+            "environment.target_motion.counts.enemy_size / target_size / num_targets. "
+            "Please re-export the bundle with the updated export script."
+        )
+
+    @staticmethod
+    def _is_auto_value(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("", "auto")
+        if isinstance(value, (list, tuple)):
+            return len(value) == 0 or (len(value) == 1 and EnemyTargetManager._is_auto_value(value[0]))
+        return False
+
+    def _topic_list_param(self, ros_name: str, count: int, factory, label: str) -> list[str]:
+        value = rospy.get_param(f"~{ros_name}", "auto")
+        if self._is_auto_value(value):
+            return [factory(i) for i in range(count)]
+        if isinstance(value, str):
+            value = [value]
+        value = [str(x) for x in list(value)]
+        if len(value) != count:
+            raise ValueError(
+                f"{label} length ({len(value)}) must equal bundle-derived count ({count}). "
+                f"Set ~{ros_name}: auto or remove it to generate topics automatically."
+            )
+        return value
+
+    @staticmethod
+    def _xy_array(value, default, label: str) -> np.ndarray:
+        if EnemyTargetManager._is_auto_value(value):
+            value = default
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        if arr.size < 2:
+            raise ValueError(f"{label} must contain at least two numeric values [x, y], got {value!r}")
+        if not np.isfinite(arr[:2]).all():
+            raise ValueError(f"{label} must be finite [x, y], got {value!r}")
+        return arr[:2].astype(np.float32)
+
+    def _xyz_list_param(self, ros_name: str, count: int, default_factory, label: str) -> np.ndarray:
+        value = rospy.get_param(f"~{ros_name}", "auto")
+        if self._is_auto_value(value):
+            rows = [default_factory(i) for i in range(count)]
+        else:
+            rows = value
+            if isinstance(rows, str):
+                raise ValueError(f"{label} must be a list of [x, y, z], got string {rows!r}")
+            rows = list(rows)
+        if len(rows) != count:
+            raise ValueError(f"{label} length ({len(rows)}) must equal friend count ({count})")
+        out = np.zeros((count, 3), dtype=np.float32)
+        for i, row in enumerate(rows):
+            arr = np.asarray(row, dtype=np.float32).reshape(-1)
+            if arr.size < 3:
+                raise ValueError(f"{label}[{i}] must be [x, y, z], got {row!r}")
+            if not np.isfinite(arr[:3]).all():
+                raise ValueError(f"{label}[{i}] must contain finite values, got {row!r}")
+            out[i, :] = arr[:3]
+        return out
+
+    def _float_list_param(self, ros_name: str, count: int, default: float, label: str) -> np.ndarray:
+        value = rospy.get_param(f"~{ros_name}", "auto")
+        if self._is_auto_value(value):
+            values = [default for _ in range(count)]
+        elif isinstance(value, (int, float)):
+            values = [float(value) for _ in range(count)]
+        else:
+            values = list(value)
+        if len(values) != count:
+            raise ValueError(f"{label} length ({len(values)}) must equal friend count ({count})")
+        out = np.asarray(values, dtype=np.float32).reshape(-1)
+        if not np.isfinite(out).all():
+            raise ValueError(f"{label} must contain finite values, got {values!r}")
+        return out
+
+    @staticmethod
+    def _command_output_is_raw(frame_name: str) -> bool:
+        return str(frame_name).strip().lower() in ("raw", "local", "odom_raw", "raw_local", "local_odom")
+
+    def _world_point_to_raw(self, idx: int, xyz: np.ndarray) -> np.ndarray:
+        xyz = np.asarray(xyz, dtype=np.float32).reshape(3)
+        d = xyz - self.world_xyz_offsets[idx]
+        yaw = float(self.world_yaw_offsets_rad[idx])
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        # Rz(yaw)^T * (p_world - offset)
+        return np.asarray([c * d[0] + s * d[1], -s * d[0] + c * d[1], d[2]], dtype=np.float32)
+
+    def _world_vector_to_raw(self, idx: int, xyz: np.ndarray) -> np.ndarray:
+        xyz = np.asarray(xyz, dtype=np.float32).reshape(3)
+        yaw = float(self.world_yaw_offsets_rad[idx])
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        # Rz(yaw)^T * v_world
+        return np.asarray([c * xyz[0] + s * xyz[1], -s * xyz[0] + c * xyz[1], xyz[2]], dtype=np.float32)
+
+    def _requires_prestart_gate(self) -> bool:
+        return bool(
+            self.require_friend_yaw_aligned
+            or self.require_friend_formation_aligned
+            or self.require_friend_velocity_aligned
+        )
+
+    def _target_bundle_get(self, group: str, name: str, default=None):
+        return self._bundle_get("environment", "target_motion", group, name, default=default)
+
+    def _sensor_bundle_get(self, group: str, name: str, default=None):
+        return self._bundle_get("environment", "sensors", group, name, default=default)
+
+    def _read_target_value(self, ros_name: str, default, group: str, bundle_name: str | None = None):
+        """Read target/enemy config strictly from the exported bundle.
+
+        ROS/YAML parameters intentionally do not override these fields. The default is
+        only used for backward compatibility when an older bundle lacks an optional key.
+        """
+        key = bundle_name or ros_name
+        value = self._target_bundle_get(group, key, default=None)
+        return default if value is None else value
+
+    def _read_target_float(self, ros_name: str, default: float, group: str, bundle_name: str | None = None) -> float:
+        return float(self._read_target_value(ros_name, default, group, bundle_name))
+
+    def _read_target_int(self, ros_name: str, default: int, group: str, bundle_name: str | None = None) -> int:
+        return int(self._read_target_value(ros_name, default, group, bundle_name))
+
+    def _read_target_str(self, ros_name: str, default: str, group: str, bundle_name: str | None = None) -> str:
+        return str(self._read_target_value(ros_name, default, group, bundle_name))
+
+    def _read_target_list(self, ros_name: str, default, group: str, bundle_name: str | None = None):
+        value = self._read_target_value(ros_name, default, group, bundle_name)
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    @staticmethod
+    def _normalize_formation_name(name: str) -> str:
+        return str(name).strip().lower().replace("-", "_").replace(" ", "")
+
+    def _formation_type_from_bundle(self) -> Optional[str]:
+        # Isaac env template ids:
+        #   0 v_wedge_2d, 1 rect2d, 2 square2d, 3 rect3d, 4 cube3d, 5 poisson3d,
+        #   6 circle2d, 7 line2d, 8 cross2d5, 9 pyramid3d5, 10 echelon_2d
+        id_to_ros = {
+            0: "v_wedge_2d",
+            1: "rect2d",
+            2: "rect2d",
+            3: "random_disk",
+            4: "random_disk",
+            5: "random_disk",
+            6: "circle2d",
+            7: "line2d",
+            8: "random_disk",
+            9: "random_disk",
+            10: "echelon_2d",
+        }
+        name_map = {
+            "v_wedge_2d": "v_wedge_2d",
+            "rect2d": "rect2d",
+            "square2d": "rect2d",
+            "rect3d": "random_disk",
+            "cube3d": "random_disk",
+            "poisson3d": "random_disk",
+            "circle2d": "circle2d",
+            "line2d": "line2d",
+            "cross2d5": "random_disk",
+            "pyramid3d5": "random_disk",
+            "echelon_2d": "echelon_2d",
+        }
+
+        ids = self._target_bundle_get("formation", "enemy_formation_template_ids", default=None)
+        names = self._target_bundle_get("formation", "enemy_formation_templates", default=None)
+
+        candidates = []
+        if ids is not None:
+            if not isinstance(ids, (list, tuple)):
+                ids = [ids]
+            for item in ids:
+                try:
+                    mapped = id_to_ros.get(int(item))
+                except Exception:
+                    mapped = None
+                if mapped is not None:
+                    candidates.append(mapped)
+        elif names is not None:
+            if isinstance(names, str):
+                names = [names]
+            for item in names:
+                key = self._normalize_formation_name(item)
+                if key in ("all", "*"):
+                    return "random"
+                mapped = name_map.get(key)
+                if mapped is not None:
+                    candidates.append(mapped)
+
+        candidates = sorted(set(candidates))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            return "random"
+        return None
+
+
+    def _formation_type_from_yaml(self) -> tuple[Optional[str], str]:
+        """Read deployment formation selection from ROS/YAML.
+
+        Priority:
+          1) ~formation_type when set to a concrete name.
+          2) ~formation_id when set to a concrete id.
+          3) None, meaning fall back to bundle formation templates.
+
+        Accepted formation_type values:
+          random, line2d, circle2d, v_wedge_2d, rect2d, echelon_2d, random_disk
+        Accepted formation_id values:
+          0=random, 1=line2d, 2=circle2d, 3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk
+        """
+        formation_type_param = rospy.get_param("~formation_type", "auto")
+        if not self._is_auto_value(formation_type_param):
+            name = self._normalize_formation_name(str(formation_type_param))
+            alias_map = {
+                "random": "random",
+                "line": "line2d",
+                "line2d": "line2d",
+                "circle": "circle2d",
+                "circle2d": "circle2d",
+                "v": "v_wedge_2d",
+                "wedge": "v_wedge_2d",
+                "vwedge": "v_wedge_2d",
+                "vwedge2d": "v_wedge_2d",
+                "v_wedge": "v_wedge_2d",
+                "v_wedge_2d": "v_wedge_2d",
+                "rect": "rect2d",
+                "rectangle": "rect2d",
+                "rect2d": "rect2d",
+                "echelon": "echelon_2d",
+                "echelon2d": "echelon_2d",
+                "echelon_2d": "echelon_2d",
+                "disk": "random_disk",
+                "randomdisk": "random_disk",
+                "random_disk": "random_disk",
+            }
+            if name not in alias_map:
+                raise ValueError(
+                    "~formation_type must be one of "
+                    "random, line2d, circle2d, v_wedge_2d, rect2d, echelon_2d, random_disk, "
+                    f"got {formation_type_param!r}"
+                )
+            return alias_map[name], "yaml:formation_type"
+
+        formation_id_param = rospy.get_param("~formation_id", "auto")
+        if not self._is_auto_value(formation_id_param):
+            try:
+                fid = int(formation_id_param)
+            except Exception as exc:
+                raise ValueError(f"~formation_id must be an integer id or 'auto', got {formation_id_param!r}") from exc
+            mapped = self.formation_id_map.get(fid)
+            if mapped is None:
+                raise ValueError(
+                    "~formation_id must be one of 0=random, 1=line2d, 2=circle2d, "
+                    "3=v_wedge_2d, 4=rect2d, 5=echelon_2d, 6=random_disk, "
+                    f"got {formation_id_param!r}"
+                )
+            self.formation_id = fid
+            return mapped, "yaml:formation_id"
+
+        return None, "bundle"
+
+    def _select_formation_type(self) -> tuple[str, str]:
+        yaml_formation, source = self._formation_type_from_yaml()
+        if yaml_formation is not None:
+            return yaml_formation, source
+        bundle_formation = self._formation_type_from_bundle()
+        if bundle_formation is not None:
+            return bundle_formation, "bundle"
+        return "random", "default:random"
+
+    def __init__(self) -> None:
+        # ----------------------- exported bundle config -----------------------
+        # Target/enemy motion and spawn config are read strictly from bundle_dir/policy_config.json.
+        # YAML remains responsible only for ROS wiring and deployment-only behavior.
+        self.bundle_dir_param = str(rospy.get_param("~bundle_dir", "")).strip()
+        self.bundle_dir = Path(self.bundle_dir_param).resolve() if self.bundle_dir_param else None
+        self.bundle_cfg = self._load_bundle_config()
+
+        # ----------------------------- basic -----------------------------
+        self.frame_id = rospy.get_param("~frame_id", "map")
+        self.publish_rate = float(rospy.get_param("~publish_rate", 30.0))
+
+        # Friend/target counts are part of the exported training/deployment bundle.
+        self.friend_size = self._bundle_friend_count()
+        self.enemy_size = self._bundle_enemy_count()
+
+        self.friend_odom_topics = self._topic_list_param(
+            "friend_odom_topics",
+            self.friend_size,
+            lambda i: f"/uav{i}/odom",
+            "friend_odom_topics",
+        )
+        self.enemy_odom_topics = self._topic_list_param(
+            "enemy_odom_topics",
+            self.enemy_size,
+            lambda i: f"/enemy{i}/odom",
+            "enemy_odom_topics",
+        )
+
+        # ----------------------------- motion ----------------------------
+        self.enemy_speed = self._read_target_float("enemy_speed", 2.3, "motion")
+        self.enemy_motion_mode = self._read_target_str("enemy_motion_mode", "force_field", "motion").lower()
+        self.enemy_goal_radius = self._read_target_float("enemy_goal_radius", 0.1, "motion")
+        self.enemy_target_alt = self._read_target_float("enemy_target_alt", 1.0, "motion")
+        # goal z / target altitude is bundle-owned. YAML may only provide world-frame goal_xy
+        # for deployment coordinate placement; legacy goal_xyz z is ignored if present.
+        goal_xy_param = rospy.get_param("~goal_xy", None)
+        if goal_xy_param is None:
+            legacy_goal_xyz = rospy.get_param("~goal_xyz", None)
+            goal_xy_param = legacy_goal_xyz[:2] if legacy_goal_xyz is not None else [0.0, 0.0]
+        goal_xy = self._xy_array(goal_xy_param, [0.0, 0.0], "~goal_xy")
+        self.goal_xyz = np.asarray([float(goal_xy[0]), float(goal_xy[1]), self.enemy_target_alt], dtype=np.float32)
+
+        self.enemy_goal_attraction_weight = self._read_target_float("enemy_goal_attraction_weight", 3.0, "force_field")
+        self.enemy_pursuer_repulsion_weight = self._read_target_float("enemy_pursuer_repulsion_weight", 1.5, "force_field")
+        self.enemy_pursuer_repulsion_range = self._read_target_float("enemy_pursuer_repulsion_range", 40.0, "force_field")
+        self.enemy_pursuer_repulsion_smooth = self._read_target_float("enemy_pursuer_repulsion_smooth", 1.0, "force_field")
+        self.enemy_pursuer_repulsion_max = self._read_target_float("enemy_pursuer_repulsion_max", 2.0, "force_field")
+        self.enemy_separation_weight = self._read_target_float("enemy_separation_weight", 0.2, "force_field")
+        self.enemy_separation_range = self._read_target_float("enemy_separation_range", 1.5, "force_field")
+        self.enemy_cohesion_weight = self._read_target_float("enemy_cohesion_weight", 0.2, "force_field")
+        self.enemy_cohesion_range = self._read_target_float("enemy_cohesion_range", 5.0, "force_field")
+        self.enemy_evasive_eps = self._read_target_float("enemy_evasive_eps", 1e-6, "motion")
+
+        # ----------------------------- spawn -----------------------------
+        self.spawn_on_start = bool(rospy.get_param("~spawn_on_start", True))
+        self.available_formations = ["line2d", "circle2d", "v_wedge_2d", "rect2d", "echelon_2d", "random_disk"]
+        self.formation_id_map = {
+            0: "random",
+            1: "line2d",
+            2: "circle2d",
+            3: "v_wedge_2d",
+            4: "rect2d",
+            5: "echelon_2d",
+            6: "random_disk",
+        }
+        # Formation selection is deployment-owned by YAML when ~formation_type or ~formation_id is set.
+        # Use "auto" or omit both params to fall back to bundle formation templates.
+        self.formation_id = -1
+        self.formation_type, self.formation_source = self._select_formation_type()
+        self.enemy_cluster_ring_radius = self._read_target_float("enemy_cluster_ring_radius", 5.0, "spawn")
+        spawn_center_xy_param = rospy.get_param("~spawn_center_xy", None)
+        self.spawn_center_xy = None if self._is_auto_value(spawn_center_xy_param) else self._xy_array(spawn_center_xy_param, [0.0, 0.0], "~spawn_center_xy")
+        self.enemy_cluster_radius = self._read_target_float("enemy_cluster_radius", 1.0, "spawn")
+        self.enemy_height_min = self._read_target_float("enemy_height_min", 1.0, "spawn")
+        self.enemy_height_max = self._read_target_float("enemy_height_max", 1.0, "spawn")
+        sep_default = self._read_target_float("enemy_min_separation", 1.0, "spawn")
+        self.enemy_min_separation_min = self._read_target_float("enemy_min_separation_min", sep_default, "spawn")
+        self.enemy_min_separation_max = self._read_target_float("enemy_min_separation_max", self.enemy_min_separation_min, "spawn")
+        self.enemy_vertical_separation = self._read_target_float("enemy_vertical_separation", self.enemy_min_separation_min, "spawn")
+        self.random_seed = int(rospy.get_param("~random_seed", 0))
+        self.fixed_spawn_theta_deg = float(rospy.get_param("~fixed_spawn_theta_deg", -9999.0))
+
+        # ---------------------- arena-constrained spawn ----------------------
+        # spawn_mode:
+        #   - "legacy" / "fixed_theta": original behavior, center = goal + R*[cos(theta), sin(theta)]
+        #   - "arena_constrained": keep the target cluster center inside a fixed world-frame arena
+        #     while preserving its distance to goal_xyz.
+        self.spawn_mode = str(rospy.get_param("~spawn_mode", "legacy")).lower()
+        arena_center_xy_param = rospy.get_param("~arena_center_xy", [0.0, 0.0])
+        self.arena_center_xy = self._xy_array(arena_center_xy_param, [0.0, 0.0], "~arena_center_xy")
+        self.arena_radius = float(rospy.get_param("~arena_radius", 6.0))
+        self.arena_margin = float(rospy.get_param("~arena_margin", 0.0))
+        self.arena_include_enemy_cluster_radius = bool(rospy.get_param("~arena_include_enemy_cluster_radius", True))
+        self.prefer_friend_front = bool(rospy.get_param("~prefer_friend_front", True))
+        self.spawn_front_cone_deg = float(rospy.get_param("~spawn_front_cone_deg", 120.0))
+        self.spawn_sample_count = int(rospy.get_param("~spawn_sample_count", 721))
+        self.friend_yaw_source_index = int(rospy.get_param("~friend_yaw_source_index", -1))
+        self.allow_shrink_spawn_radius = bool(rospy.get_param("~allow_shrink_spawn_radius", False))
+        self.enemy_cluster_ring_radius_min = float(rospy.get_param("~enemy_cluster_ring_radius_min", max(0.5, 0.5 * self.enemy_cluster_ring_radius)))
+        self.spawn_radius_shrink_step = float(rospy.get_param("~spawn_radius_shrink_step", 0.25))
+        self.spawn_full_circle_fallback = bool(rospy.get_param("~spawn_full_circle_fallback", True))
+        # front_best: choose the feasible point closest to friend heading.
+        # random_feasible: randomly choose one feasible point in the allowed arena/ring domain.
+        self.spawn_selection_mode = str(rospy.get_param("~spawn_selection_mode", "front_best")).lower()
+        if self.spawn_selection_mode not in ("front_best", "best", "random_feasible", "random"):
+            rospy.logwarn("Unknown spawn_selection_mode=%s, fallback to front_best", self.spawn_selection_mode)
+            self.spawn_selection_mode = "front_best"
+
+        self.require_friend_yaw_aligned = bool(rospy.get_param("~require_friend_yaw_aligned", True))
+        self.yaw_align_tolerance_deg = float(rospy.get_param("~yaw_align_tolerance_deg", 8.0))
+        self.yaw_align_command_rate = float(rospy.get_param("~yaw_align_command_rate", 0.8))
+        # After all friendly UAVs face the target cluster center, keep holding
+        # yaw alignment for this many seconds before releasing enemy odometry/motion.
+        self.yaw_align_release_delay_sec = float(rospy.get_param("~yaw_align_release_delay_sec", 0.0))
+        self.yaw_align_command_topics = self._topic_list_param(
+            "yaw_align_command_topics",
+            self.friend_size,
+            lambda i: f"/uav{i}/position_cmd",
+            "yaw_align_command_topics",
+        )
+        # PositionCommand output coordinate frame.
+        #   world: publish the world-frame setpoint computed by this node.
+        #   raw/local: convert world setpoints to each UAV's FAST-LIO raw/local frame
+        #              before publishing. This is useful when sim_friend_odom publishes
+        #              /uav{i}/odom_raw and directly consumes /uav{i}/position_cmd.
+        self.position_cmd_output_frame = str(rospy.get_param("~position_cmd_output_frame", "world")).strip().lower()
+        if self.position_cmd_output_frame not in ("world", "raw", "local", "odom_raw", "raw_local", "local_odom"):
+            raise ValueError("~position_cmd_output_frame must be 'world' or 'raw/local/odom_raw'")
+        self.raw_command_frame_ids = self._topic_list_param(
+            "raw_command_frame_ids",
+            self.friend_size,
+            lambda i: f"uav{i}/odom_raw_local",
+            "raw_command_frame_ids",
+        )
+        self.world_xyz_offsets = self._xyz_list_param(
+            "world_xyz_offsets",
+            self.friend_size,
+            lambda _i: [0.0, 0.0, 0.0],
+            "world_xyz_offsets",
+        )
+        self.world_yaw_offsets_rad = np.deg2rad(self._float_list_param(
+            "world_yaw_offsets_deg",
+            self.friend_size,
+            0.0,
+            "world_yaw_offsets_deg",
+        )).astype(np.float32)
+        self.yaw_align_kx = rospy.get_param("~yaw_align_kx", [0.0, 0.0, 0.0])
+        self.yaw_align_kv = rospy.get_param("~yaw_align_kv", [0.0, 0.0, 0.0])
+
+        # ------------------ RL-env style friendly pre-start formation ------------------
+        # When enabled, enemy odometry/motion will not be released until all friendly UAVs
+        # reach the same initial formation used by SwarmInterceptionEnv._reset_idx():
+        #   x_local = -row_idx * row_spacing, y_local = [0, -1, +1, -2, +2, ...] * lat_spacing,
+        #   z = flight_altitude + row_idx * row_height_diff,
+        # rotated so the formation faces the spawned enemy cluster center.
+        self.require_friend_formation_aligned = bool(rospy.get_param("~require_friend_formation_aligned", True))
+        self.friend_agents_per_row = int(rospy.get_param("~friend_agents_per_row", 5))
+        self.friend_lat_spacing = float(rospy.get_param("~friend_lat_spacing", 1.0))
+        self.friend_row_spacing = float(rospy.get_param("~friend_row_spacing", 3.0))
+        self.friend_row_height_diff = float(rospy.get_param("~friend_row_height_diff", 3.0))
+        self.friend_flight_altitude = float(rospy.get_param("~friend_flight_altitude", float(self.goal_xyz[2])))
+        self.friend_formation_position_tolerance = float(rospy.get_param("~friend_formation_position_tolerance", 0.25))
+        self.friend_formation_z_tolerance = float(rospy.get_param("~friend_formation_z_tolerance", self.friend_formation_position_tolerance))
+        self.friend_formation_velocity_tolerance = float(rospy.get_param("~friend_formation_velocity_tolerance", 0.25))
+        self.require_friend_velocity_aligned = bool(rospy.get_param("~require_friend_velocity_aligned", False))
+        friend_formation_anchor_xy_param = rospy.get_param("~friend_formation_anchor_xy", None)
+        self.friend_formation_anchor_xy = (
+            None
+            if self._is_auto_value(friend_formation_anchor_xy_param)
+            else self._xy_array(friend_formation_anchor_xy_param, [0.0, 0.0], "~friend_formation_anchor_xy")
+        )
+        # Gains written into PositionCommand for downstream controllers that use msg.kx/msg.kv.
+        # If your PX4 controller ignores these fields, it will still receive position/yaw setpoints.
+        self.friend_formation_kx = rospy.get_param("~friend_formation_kx", [1.5, 1.5, 1.5])
+        self.friend_formation_kv = rospy.get_param("~friend_formation_kv", [1.0, 1.0, 1.0])
+        self.freeze_when_reach_goal = bool(rospy.get_param("~freeze_when_reach_goal", False))
+        self.terminate_on_goal_reach = bool(rospy.get_param("~terminate_on_goal_reach", True))
+        self.stop_publish_after_terminate = bool(rospy.get_param("~stop_publish_after_terminate", True))
+        self.clear_markers_on_terminate = bool(rospy.get_param("~clear_markers_on_terminate", True))
+
+        # ---------------------------- hit sync ---------------------------
+        self.friendly_states_topic = rospy.get_param("~friendly_states_topic", "/swarm_state_manager/friendly_states")
+        self.hit_enemy_indices_topic = rospy.get_param("~hit_enemy_indices_topic", "/swarm_state_manager/hit_enemy_indices")
+        self.freeze_enemy_on_hit = bool(rospy.get_param("~freeze_enemy_on_hit", True))
+        self.keep_exists_true_when_hit = bool(rospy.get_param("~keep_exists_true_when_hit", True))
+
+        # -------------------------- visualization ------------------------
+        self.publish_markers = bool(rospy.get_param("~publish_markers", True))
+        self.marker_topic = rospy.get_param("~marker_topic", "~markers")
+        self.arena_marker_topic = rospy.get_param("~arena_marker_topic", "~arena_marker")
+        self.spawn_constraint_marker_topic = rospy.get_param("~spawn_constraint_marker_topic", "~spawn_constraint_marker")
+        self.enemy_marker_scale = float(rospy.get_param("~enemy_marker_scale", 0.25))
+        self.goal_marker_scale = float(rospy.get_param("~goal_marker_scale", 0.35))
+        self.arrow_shaft_d = float(rospy.get_param("~arrow_shaft_d", 0.06))
+        self.arrow_head_d = float(rospy.get_param("~arrow_head_d", 0.12))
+        self.arrow_head_l = float(rospy.get_param("~arrow_head_l", 0.18))
+        self.show_velocity_arrows = bool(rospy.get_param("~show_velocity_arrows", True))
+        self.show_text = bool(rospy.get_param("~show_text", True))
+        self.show_trails = bool(rospy.get_param("~show_trails", False))
+        self.trail_length = int(rospy.get_param("~trail_length", 80))
+        self.publish_arena_marker = bool(rospy.get_param("~publish_arena_marker", True))
+        self.publish_spawn_constraint_marker = bool(rospy.get_param("~publish_spawn_constraint_marker", True))
+        self.arena_marker_z = float(rospy.get_param("~arena_marker_z", 0.03))
+        self.arena_marker_points = int(rospy.get_param("~arena_marker_points", 180))
+        self.arena_marker_line_width = float(rospy.get_param("~arena_marker_line_width", 0.04))
+        self.spawn_ring_marker_line_width = float(rospy.get_param("~spawn_ring_marker_line_width", 0.025))
+
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+
+        if self.enemy_motion_mode not in ("translate", "force_field"):
+            raise ValueError("enemy_motion_mode must be 'translate' or 'force_field'")
+
+        self.friend_states: List[EntityState] = [EntityState() for _ in range(len(self.friend_odom_topics))]
+        self.friend_frozen = np.zeros(len(self.friend_odom_topics), dtype=bool)
+        self.enemies: List[EnemyState] = [EnemyState() for _ in range(self.enemy_size)]
+        self._last_time: Optional[rospy.Time] = None
+        self._spawn_pending = False
+        self._enemies_spawned = False
+        self._motion_released = not self._requires_prestart_gate()
+        self._yaw_aligned_since: Optional[rospy.Time] = None
+        self._spawn_center_xy: Optional[np.ndarray] = None
+        self._friend_formation_targets: Optional[np.ndarray] = None  # [M,3], world-frame desired pre-start positions
+        self._enemy_trails: List[List[np.ndarray]] = [[] for _ in range(self.enemy_size)]
+        self._episode_terminated = False
+        self._termination_reason = ""
+        self._termination_stamp: Optional[rospy.Time] = None
+        self._markers_cleared_after_terminate = False
+
+        # -------------------------- publishers ---------------------------
+        self.enemy_pubs = [rospy.Publisher(topic, Odometry, queue_size=1) for topic in self.enemy_odom_topics]
+        self.enemy_exists_pub = rospy.Publisher("~enemy_exists", UInt8MultiArray, queue_size=1, latch=True)
+        self.enemy_frozen_pub = rospy.Publisher("~enemy_frozen", UInt8MultiArray, queue_size=1, latch=True)
+        self.enemy_alive_pub = rospy.Publisher("~enemy_alive", UInt8MultiArray, queue_size=1, latch=True)
+        self.episode_terminated_pub = rospy.Publisher("~episode_terminated", Bool, queue_size=1, latch=True)
+        self.termination_reason_pub = rospy.Publisher("~termination_reason", String, queue_size=1, latch=True)
+        self.marker_pub = rospy.Publisher(self.marker_topic, MarkerArray, queue_size=1)
+        self.arena_marker_pub = rospy.Publisher(self.arena_marker_topic, MarkerArray, queue_size=1, latch=True)
+        self.spawn_constraint_marker_pub = rospy.Publisher(self.spawn_constraint_marker_topic, MarkerArray, queue_size=1, latch=True)
+        self.yaw_align_pubs = [
+            rospy.Publisher(topic, PositionCommand, queue_size=1)
+            for topic in self.yaw_align_command_topics
+        ]
+
+        # ------------------------- subscriptions -------------------------
+        self.friend_subs = []
+        for i, topic in enumerate(self.friend_odom_topics):
+            self.friend_subs.append(rospy.Subscriber(topic, Odometry, self._make_friend_cb(i), queue_size=1))
+
+        self.friendly_states_sub = rospy.Subscriber(
+            self.friendly_states_topic,
+            Float32MultiArray,
+            self._friendly_states_cb,
+            queue_size=1,
+        )
+
+        self.hit_enemy_indices_sub = rospy.Subscriber(
+            self.hit_enemy_indices_topic,
+            Int32MultiArray,
+            self._hit_enemy_indices_cb,
+            queue_size=1,
+        )
+
+        # ---------------------------- startup ----------------------------
+        if self.spawn_on_start:
+            self._spawn_pending = True
+        self.publish_enemy_masks(force=True)
+        self.publish_termination_status()
+        self.publish_all_odometry(rospy.Time.now())
+        if self.publish_markers:
+            self.publish_marker_array(rospy.Time.now())
+
+        self.timer = rospy.Timer(rospy.Duration.from_sec(1.0 / max(self.publish_rate, 1e-3)), self._timer_cb)
+
+        rospy.loginfo("Enemy target manager ready")
+        rospy.loginfo(
+            "bundle_dir=%s target_motion_source=policy_config.json target_motion_loaded=%s",
+            str(self.bundle_dir) if self.bundle_dir is not None else "",
+            bool(self._bundle_get("environment", "target_motion", default=None)),
+        )
+        rospy.loginfo("friend_size=%d enemy_size=%d motion_mode=%s formation_type=%s formation_id=%d formation_source=%s", self.friend_size, self.enemy_size, self.enemy_motion_mode, self.formation_type, self.formation_id, self.formation_source)
+        rospy.loginfo("available formation_type: %s", ["random"] + self.available_formations)
+        rospy.loginfo("formation_id map: %s", self.formation_id_map)
+        rospy.loginfo("friend_odom_topics=%s", self.friend_odom_topics)
+        rospy.loginfo("enemy_odom_topics=%s", self.enemy_odom_topics)
+        rospy.loginfo("goal_xyz=%s", self.goal_xyz.tolist())
+        rospy.loginfo(
+            "target motion config: mode=%s speed=%.3f goal_radius=%.3f target_alt=%.3f force_field=[goal=%.3f pursuer=%.3f range=%.3f smooth=%.3f max=%.3f sep=%.3f/%.3f coh=%.3f/%.3f]",
+            self.enemy_motion_mode,
+            self.enemy_speed,
+            self.enemy_goal_radius,
+            self.enemy_target_alt,
+            self.enemy_goal_attraction_weight,
+            self.enemy_pursuer_repulsion_weight,
+            self.enemy_pursuer_repulsion_range,
+            self.enemy_pursuer_repulsion_smooth,
+            self.enemy_pursuer_repulsion_max,
+            self.enemy_separation_weight,
+            self.enemy_separation_range,
+            self.enemy_cohesion_weight,
+            self.enemy_cohesion_range,
+        )
+        rospy.loginfo(
+            "require_friend_yaw_aligned=%s yaw_align_tolerance_deg=%.3f yaw_align_release_delay_sec=%.3f yaw_align_command_topics=%s",
+            self.require_friend_yaw_aligned,
+            self.yaw_align_tolerance_deg,
+            self.yaw_align_release_delay_sec,
+            self.yaw_align_command_topics,
+        )
+        rospy.loginfo(
+            "position_cmd_output_frame=%s raw_command_frame_ids=%s world_xyz_offsets=%s world_yaw_offsets_deg=%s",
+            self.position_cmd_output_frame,
+            self.raw_command_frame_ids,
+            self.world_xyz_offsets.tolist(),
+            np.rad2deg(self.world_yaw_offsets_rad).tolist(),
+        )
+        rospy.loginfo(
+            "require_friend_formation_aligned=%s agents_per_row=%d lat_spacing=%.3f row_spacing=%.3f row_height_diff=%.3f flight_altitude=%.3f pos_tol=%.3f z_tol=%.3f vel_tol=%.3f anchor_xy=%s",
+            self.require_friend_formation_aligned,
+            self.friend_agents_per_row,
+            self.friend_lat_spacing,
+            self.friend_row_spacing,
+            self.friend_row_height_diff,
+            self.friend_flight_altitude,
+            self.friend_formation_position_tolerance,
+            self.friend_formation_z_tolerance,
+            self.friend_formation_velocity_tolerance,
+            None if self.friend_formation_anchor_xy is None else self.friend_formation_anchor_xy.tolist(),
+        )
+        rospy.loginfo("enemy_cluster_ring_radius=%.3f", self.enemy_cluster_ring_radius)
+        rospy.loginfo("fixed_spawn_theta_deg=%.3f", self.fixed_spawn_theta_deg)
+        rospy.loginfo(
+            "spawn_mode=%s arena_center_xy=%s arena_radius=%.3f arena_margin=%.3f effective_arena_radius=%.3f prefer_friend_front=%s",
+            self.spawn_mode,
+            self.arena_center_xy.tolist(),
+            self.arena_radius,
+            self.arena_margin,
+            self._effective_arena_radius(),
+            self.prefer_friend_front,
+        )
+        rospy.loginfo(
+            "spawn_selection_mode=%s marker_topic=%s arena_marker_topic=%s spawn_constraint_marker_topic=%s",
+            self.spawn_selection_mode,
+            self.marker_topic,
+            self.arena_marker_topic,
+            self.spawn_constraint_marker_topic,
+        )
+        if self.spawn_center_xy is not None:
+            rospy.loginfo("spawn_center_xy=%s (explicit)", self.spawn_center_xy.tolist())
+        if self.enemy_cluster_ring_radius <= 1e-6 and self.spawn_center_xy is None:
+            rospy.logwarn("enemy_cluster_ring_radius is near zero and spawn_center_xy is not set; enemies may spawn at the goal/origin")
+
+    # ------------------------------------------------------------------
+    # subscriptions
+    # ------------------------------------------------------------------
+    def _make_friend_cb(self, idx: int):
+        def _cb(msg: Odometry) -> None:
+            self.friend_states[idx] = self._odom_to_entity(msg)
+        return _cb
+
+    def _hit_enemy_indices_cb(self, msg: Int32MultiArray) -> None:
+        if not self.freeze_enemy_on_hit:
+            return
+        for source_idx, enemy_idx in enumerate(msg.data):
+            enemy_idx = int(enemy_idx)
+            if 0 <= enemy_idx < self.enemy_size:
+                self._freeze_enemy(enemy_idx, reason=f"hit_enemy_indices[{source_idx}]")
+
+    def _friendly_states_cb(self, msg: Float32MultiArray) -> None:
+        arr = np.asarray(msg.data, dtype=np.float32)
+        if arr.size % 11 != 0:
+            rospy.logwarn_throttle(1.0, "friendly_states length %d is not divisible by 11", arr.size)
+            return
+        rows = arr.reshape((-1, 11))
+        out = np.zeros(len(self.friend_states), dtype=bool)
+        n = min(out.size, rows.shape[0])
+        # friendly_states columns: id, pos[3], vel[3], yaw, valid, frozen, hit
+        out[:n] = np.logical_or(rows[:n, 9] > 0.5, rows[:n, 10] > 0.5)
+        self.friend_frozen = out
+
+    # ------------------------------------------------------------------
+    # message conversion
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _odom_to_entity(msg: Odometry) -> EntityState:
+        q = msg.pose.pose.orientation
+        out = EntityState()
+        out.pos = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z], dtype=np.float32)
+        out.vel = np.array([msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z], dtype=np.float32)
+        out.quat_wxyz = np.array([q.w, q.x, q.y, q.z], dtype=np.float32)
+        out.received = True
+        return out
+
+    @staticmethod
+    def _yaw_from_quat_wxyz(q: np.ndarray) -> float:
+        w, x, y, z = [float(v) for v in q]
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    # ------------------------------------------------------------------
+    # state / spawn
+    # ------------------------------------------------------------------
+    def spawn_enemies(self) -> None:
+        self._spawn_pending = False
+        self._enemies_spawned = False
+        self._motion_released = not self._requires_prestart_gate()
+        self._yaw_aligned_since = None
+        self._friend_formation_targets = None
+        self._episode_terminated = False
+        self._termination_reason = ""
+        self._termination_stamp = None
+        self._markers_cleared_after_terminate = False
+        local = self._generate_local_template(self.enemy_size)
+        center_xy = self._sample_spawn_center_xy()
+        if center_xy is None:
+            self._spawn_pending = True
+            rospy.logwarn_throttle(
+                1.0,
+                "No feasible enemy spawn center yet. Waiting. goal_xy=%s arena_center_xy=%s enemy_cluster_ring_radius=%.3f effective_arena_radius=%.3f",
+                self.goal_xyz[:2].tolist(),
+                self.arena_center_xy.tolist(),
+                self.enemy_cluster_ring_radius,
+                self._effective_arena_radius(),
+            )
+            return
+        self._spawn_center_xy = center_xy.astype(np.float32)
+        goal_xy = self.goal_xyz[:2]
+        head_vec = goal_xy - center_xy
+        head_norm = np.linalg.norm(head_vec)
+        if head_norm < 1e-6:
+            head_vec = np.array([1.0, 0.0], dtype=np.float32)
+            head_norm = 1.0
+        head = head_vec / head_norm
+        rot = np.array([[head[0], -head[1]], [head[1], head[0]]], dtype=np.float32)
+
+        z_base = self.enemy_height_min + random.random() * max(self.enemy_height_max - self.enemy_height_min, 1e-6)
+        world = np.zeros((self.enemy_size, 3), dtype=np.float32)
+        world[:, :2] = center_xy[None, :] + local[:, :2] @ rot.T
+        world[:, 2] = z_base + local[:, 2]
+
+        for i in range(self.enemy_size):
+            self.enemies[i].pos = world[i].copy()
+            self.enemies[i].vel = np.zeros(3, dtype=np.float32)
+            self.enemies[i].exists = True
+            self.enemies[i].frozen = False
+            self._enemy_trails[i] = [world[i].copy()]
+        self._enemies_spawned = True
+
+        v_step = self.compute_enemy_velocity_step()
+        for i in range(self.enemy_size):
+            self.enemies[i].vel = v_step[i].copy()
+
+        self._last_time = rospy.Time.now()
+        self.publish_enemy_masks(force=True)
+        self.publish_termination_status()
+        rospy.loginfo("Spawned %d enemies with formation=%s, center_xy=(%.3f, %.3f), first_enemy=(%.3f, %.3f, %.3f)",
+                      self.enemy_size, self.formation_type,
+                      float(center_xy[0]), float(center_xy[1]),
+                      float(world[0, 0]) if self.enemy_size > 0 else 0.0,
+                      float(world[0, 1]) if self.enemy_size > 0 else 0.0,
+                      float(world[0, 2]) if self.enemy_size > 0 else 0.0)
+
+    def _target_center_xy_for_yaw_alignment(self) -> Optional[np.ndarray]:
+        if not self._enemies_spawned:
+            return None
+        if self._spawn_center_xy is not None:
+            return self._spawn_center_xy.astype(np.float32)
+        pos, _, frozen = self._enemy_arrays()
+        alive = ~frozen
+        if np.any(alive):
+            return pos[alive, :2].mean(axis=0).astype(np.float32)
+        if pos.size:
+            return pos[:, :2].mean(axis=0).astype(np.float32)
+        return None
+
+    def _friend_formation_anchor_xy(self) -> np.ndarray:
+        """World-frame anchor used by the RL reset-style friendly formation.
+
+        In SwarmInterceptionEnv._reset_idx(), the friendly formation is anchored at
+        terrain.env_origins[:, :2]. In the ROS deployment scene, goal_xyz[:2] is the
+        closest equivalent by default because the enemy goal is built from the same
+        origin in the training env. Override with ~friend_formation_anchor_xy if your
+        real-world takeoff/defense center is different from goal_xyz[:2].
+        """
+        if self.friend_formation_anchor_xy is not None:
+            return self.friend_formation_anchor_xy.astype(np.float32)
+        return self.goal_xyz[:2].astype(np.float32)
+
+    def _compute_friend_formation_targets(self) -> Optional[np.ndarray]:
+        """Compute RL-env reset-style desired positions for friendly UAVs.
+
+        Returns:
+            [M,3] array in world/map frame, where M=len(friend_odom_topics).
+        """
+        center_xy = self._target_center_xy_for_yaw_alignment()
+        if center_xy is None:
+            return None
+        M = len(self.friend_states)
+        if M <= 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        anchor_xy = self._friend_formation_anchor_xy()
+        face_xy = center_xy.astype(np.float32) - anchor_xy.astype(np.float32)
+        n = float(np.linalg.norm(face_xy))
+        if n < 1e-6:
+            face_xy = np.array([1.0, 0.0], dtype=np.float32)
+            n = 1.0
+        f_hat = face_xy / n
+        r_hat = np.array([-f_hat[1], f_hat[0]], dtype=np.float32)
+
+        agents_per_row = max(1, int(self.friend_agents_per_row))
+        out = np.zeros((M, 3), dtype=np.float32)
+        for i in range(M):
+            row_idx = i // agents_per_row
+            local_idx_in_row = i - row_idx * agents_per_row
+            if local_idx_in_row % 2 == 0:
+                pos_idx = local_idx_in_row // 2
+            else:
+                pos_idx = -((local_idx_in_row + 1) // 2)
+
+            x_local = -float(row_idx) * float(self.friend_row_spacing)
+            y_local = float(pos_idx) * float(self.friend_lat_spacing)
+            xy = anchor_xy + x_local * f_hat + y_local * r_hat
+            z = float(self.friend_flight_altitude) + float(row_idx) * float(self.friend_row_height_diff)
+            out[i, 0] = float(xy[0])
+            out[i, 1] = float(xy[1])
+            out[i, 2] = z
+        return out
+
+    def _friend_alignment_errors(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Return position/yaw/speed errors for pre-start release gating.
+
+        Returns:
+            pos_err_xy [M], pos_err_z [M], yaw_err [M], speed [M]
+        """
+        center_xy = self._target_center_xy_for_yaw_alignment()
+        if center_xy is None:
+            return None
+
+        targets = self._friend_formation_targets
+        if targets is None or targets.shape[0] != len(self.friend_states):
+            targets = self._compute_friend_formation_targets()
+            self._friend_formation_targets = targets
+        if targets is None:
+            return None
+
+        pos_err_xy = []
+        pos_err_z = []
+        yaw_errs = []
+        speeds = []
+        for i, st in enumerate(self.friend_states):
+            if not st.received or not np.isfinite(st.pos).all() or not np.isfinite(st.quat_wxyz).all():
+                return None
+            if self.require_friend_formation_aligned:
+                target_pos = targets[i]
+            else:
+                target_pos = st.pos
+            pos_err_xy.append(float(np.linalg.norm(st.pos[:2] - target_pos[:2])))
+            pos_err_z.append(abs(float(st.pos[2] - target_pos[2])))
+
+            to_center = center_xy - st.pos[:2]
+            if np.linalg.norm(to_center) < 1e-6:
+                desired_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            else:
+                desired_yaw = math.atan2(float(to_center[1]), float(to_center[0]))
+            cur_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            yaw_errs.append(_wrap_pi(desired_yaw - cur_yaw))
+            speeds.append(float(np.linalg.norm(st.vel)))
+
+        return (
+            np.asarray(pos_err_xy, dtype=np.float32),
+            np.asarray(pos_err_z, dtype=np.float32),
+            np.asarray(yaw_errs, dtype=np.float32),
+            np.asarray(speeds, dtype=np.float32),
+        )
+
+    def _friend_yaw_alignment_errors(self) -> Optional[np.ndarray]:
+        center_xy = self._target_center_xy_for_yaw_alignment()
+        if center_xy is None:
+            return None
+        errors = []
+        for st in self.friend_states:
+            if not st.received or not np.isfinite(st.pos).all():
+                return None
+            to_center = center_xy - st.pos[:2]
+            if np.linalg.norm(to_center) < 1e-6:
+                desired_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            else:
+                desired_yaw = math.atan2(float(to_center[1]), float(to_center[0]))
+            cur_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            errors.append(_wrap_pi(desired_yaw - cur_yaw))
+        return np.asarray(errors, dtype=np.float32)
+
+    def _publish_yaw_align_commands(self, stamp: rospy.Time) -> None:
+        """Publish pre-start position/yaw commands.
+
+        If require_friend_formation_aligned is true, position setpoints are the RL-env
+        reset-style formation targets. Otherwise, positions are held at the current odom
+        positions and only yaw alignment is commanded, matching the old behavior.
+        """
+        center_xy = self._target_center_xy_for_yaw_alignment()
+        if center_xy is None:
+            return
+
+        targets = self._friend_formation_targets
+        if self.require_friend_formation_aligned and (targets is None or targets.shape[0] != len(self.friend_states)):
+            targets = self._compute_friend_formation_targets()
+            self._friend_formation_targets = targets
+
+        n = min(len(self.friend_states), len(self.yaw_align_pubs))
+        for i in range(n):
+            st = self.friend_states[i]
+            if not st.received:
+                continue
+
+            if self.require_friend_formation_aligned and targets is not None:
+                target_pos = targets[i]
+                kx = self.friend_formation_kx
+                kv = self.friend_formation_kv
+            else:
+                target_pos = st.pos
+                kx = self.yaw_align_kx
+                kv = self.yaw_align_kv
+
+            to_center = center_xy - st.pos[:2]
+            if np.linalg.norm(to_center) < 1e-6:
+                desired_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            else:
+                desired_yaw = math.atan2(float(to_center[1]), float(to_center[0]))
+            cur_yaw = self._yaw_from_quat_wxyz(st.quat_wxyz)
+            yaw_err = _wrap_pi(desired_yaw - cur_yaw)
+            yaw_dot = float(np.clip(yaw_err * self.yaw_align_command_rate, -self.yaw_align_command_rate, self.yaw_align_command_rate))
+
+            cmd_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
+            cmd_yaw = float(desired_yaw)
+            cmd_frame_id = self.frame_id
+            if self._command_output_is_raw(self.position_cmd_output_frame):
+                cmd_pos = self._world_point_to_raw(i, cmd_pos)
+                cmd_yaw = _wrap_pi(cmd_yaw - float(self.world_yaw_offsets_rad[i]))
+                cmd_frame_id = self.raw_command_frame_ids[i]
+
+            cmd = PositionCommand()
+            cmd.header.stamp = stamp
+            cmd.header.frame_id = cmd_frame_id
+            cmd.position.x = float(cmd_pos[0])
+            cmd.position.y = float(cmd_pos[1])
+            cmd.position.z = float(cmd_pos[2])
+            cmd.velocity.x = cmd.velocity.y = cmd.velocity.z = 0.0
+            cmd.acceleration.x = cmd.acceleration.y = cmd.acceleration.z = 0.0
+            if hasattr(cmd, "jerk"):
+                cmd.jerk.x = cmd.jerk.y = cmd.jerk.z = 0.0
+            if hasattr(cmd, "snap"):
+                cmd.snap.x = cmd.snap.y = cmd.snap.z = 0.0
+            cmd.yaw = float(cmd_yaw)
+            cmd.yaw_dot = yaw_dot
+            if hasattr(cmd, "yaw_dot_dot"):
+                cmd.yaw_dot_dot = 0.0
+            cmd.kx = kx
+            cmd.kv = kv
+            if hasattr(cmd, "trajectory_id"):
+                cmd.trajectory_id = 0
+            if hasattr(cmd, "trajectory_flag"):
+                cmd.trajectory_flag = 0
+            self.yaw_align_pubs[i].publish(cmd)
+
+    def _check_and_release_motion(self, stamp: rospy.Time) -> bool:
+        if self._motion_released:
+            return True
+
+        errors = self._friend_alignment_errors()
+        if errors is None:
+            self._yaw_aligned_since = None
+            rospy.logwarn_throttle(1.0, "Waiting for friendly odometry before pre-start formation/yaw release")
+            return False
+
+        pos_err_xy, pos_err_z, yaw_errors, speeds = errors
+        yaw_tol = math.radians(self.yaw_align_tolerance_deg)
+        max_yaw_err = float(np.max(np.abs(yaw_errors))) if yaw_errors.size else 0.0
+        max_pos_xy_err = float(np.max(pos_err_xy)) if pos_err_xy.size else 0.0
+        max_pos_z_err = float(np.max(pos_err_z)) if pos_err_z.size else 0.0
+        max_speed = float(np.max(speeds)) if speeds.size else 0.0
+
+        yaw_ok = max_yaw_err <= yaw_tol if self.require_friend_yaw_aligned else True
+        pos_ok = True
+        if self.require_friend_formation_aligned:
+            pos_ok = (
+                max_pos_xy_err <= float(self.friend_formation_position_tolerance)
+                and max_pos_z_err <= float(self.friend_formation_z_tolerance)
+            )
+        vel_ok = (max_speed <= float(self.friend_formation_velocity_tolerance)) if self.require_friend_velocity_aligned else True
+
+        if yaw_ok and pos_ok and vel_ok:
+            # All friendly UAVs satisfy the pre-start gate.
+            # Do not release immediately if yaw_align_release_delay_sec > 0.
+            if self._yaw_aligned_since is None:
+                self._yaw_aligned_since = stamp
+                rospy.loginfo(
+                    "Friendly pre-start alignment satisfied; waiting %.3fs before releasing enemy odometry/motion. max_pos_xy_err=%.3f max_pos_z_err=%.3f max_yaw_error_deg=%.3f max_speed=%.3f",
+                    self.yaw_align_release_delay_sec,
+                    max_pos_xy_err,
+                    max_pos_z_err,
+                    math.degrees(max_yaw_err),
+                    max_speed,
+                )
+
+            elapsed = max(0.0, (stamp - self._yaw_aligned_since).to_sec())
+            if elapsed >= max(0.0, self.yaw_align_release_delay_sec):
+                self._motion_released = True
+                # Reset the dynamics clock so the first released step does not integrate
+                # over the staging time spent moving into the RL-env initial formation.
+                self._last_time = stamp
+                rospy.loginfo(
+                    "Friendly pre-start alignment complete; releasing enemy odometry/masks and target motion. max_pos_xy_err=%.3f max_pos_z_err=%.3f max_yaw_error_deg=%.3f max_speed=%.3f delay_elapsed=%.3f",
+                    max_pos_xy_err,
+                    max_pos_z_err,
+                    math.degrees(max_yaw_err),
+                    max_speed,
+                    elapsed,
+                )
+                self.publish_enemy_masks(force=True)
+                self.publish_termination_status()
+                self.publish_all_odometry(stamp)
+                return True
+
+            self._publish_yaw_align_commands(stamp)
+            rospy.logwarn_throttle(
+                1.0,
+                "Friendly pre-start aligned; holding release for %.3fs more. max_pos_xy_err=%.3f max_pos_z_err=%.3f max_yaw_error_deg=%.3f max_speed=%.3f",
+                max(0.0, self.yaw_align_release_delay_sec - elapsed),
+                max_pos_xy_err,
+                max_pos_z_err,
+                math.degrees(max_yaw_err),
+                max_speed,
+            )
+            return False
+
+        # If any friendly UAV drifts out of tolerance during the delay, restart the timer.
+        self._yaw_aligned_since = None
+        self._publish_yaw_align_commands(stamp)
+        rospy.logwarn_throttle(
+            1.0,
+            "Holding enemy release until friendly UAVs match RL reset formation/yaw. pos_ok=%s yaw_ok=%s vel_ok=%s max_pos_xy_err=%.3f/%.3f max_pos_z_err=%.3f/%.3f max_yaw_error_deg=%.3f/%.3f max_speed=%.3f/%.3f",
+            pos_ok,
+            yaw_ok,
+            vel_ok,
+            max_pos_xy_err,
+            self.friend_formation_position_tolerance,
+            max_pos_z_err,
+            self.friend_formation_z_tolerance,
+            math.degrees(max_yaw_err),
+            self.yaw_align_tolerance_deg,
+            max_speed,
+            self.friend_formation_velocity_tolerance,
+        )
+        return False
+
+    def _effective_arena_radius(self) -> float:
+        """Usable radius for the cluster center in the fixed world-frame arena."""
+        shrink = self.enemy_cluster_radius if self.arena_include_enemy_cluster_radius else 0.0
+        return max(0.0, float(self.arena_radius) - float(self.arena_margin) - float(shrink))
+
+    def _xy_inside_effective_arena(self, xy: np.ndarray) -> bool:
+        r_eff = self._effective_arena_radius()
+        return float(np.linalg.norm(xy.astype(np.float32) - self.arena_center_xy.astype(np.float32))) <= r_eff + 1e-6
+
+    def _get_friend_spawn_yaw(self) -> Optional[float]:
+        """Return one yaw used only for spawn preference; it does not redefine the world frame."""
+        if len(self.friend_states) == 0:
+            return None
+
+        if self.friend_yaw_source_index >= 0:
+            if self.friend_yaw_source_index >= len(self.friend_states):
+                rospy.logwarn_throttle(1.0, "friend_yaw_source_index=%d is out of range", self.friend_yaw_source_index)
+                return None
+            st = self.friend_states[self.friend_yaw_source_index]
+            if not st.received or not np.isfinite(st.quat_wxyz).all():
+                return None
+            return self._yaw_from_quat_wxyz(st.quat_wxyz)
+
+        yaws = []
+        for st in self.friend_states:
+            if st.received and np.isfinite(st.quat_wxyz).all():
+                yaws.append(self._yaw_from_quat_wxyz(st.quat_wxyz))
+        if not yaws:
+            return None
+        s = sum(math.sin(y) for y in yaws)
+        c = sum(math.cos(y) for y in yaws)
+        return math.atan2(s, c)
+
+    def _radius_candidates(self) -> List[float]:
+        d0 = max(0.0, float(self.enemy_cluster_ring_radius))
+        if not self.allow_shrink_spawn_radius:
+            return [d0]
+        d_min = max(0.0, min(float(self.enemy_cluster_ring_radius_min), d0))
+        step = max(float(self.spawn_radius_shrink_step), 1e-3)
+        values = []
+        d = d0
+        while d >= d_min - 1e-6:
+            values.append(max(d, 0.0))
+            d -= step
+        if values[-1] > d_min + 1e-6:
+            values.append(d_min)
+        return values
+
+    def _angle_candidates(self, preferred_yaw: Optional[float]) -> List[float]:
+        n = max(int(self.spawn_sample_count), 9)
+        if preferred_yaw is None:
+            if self.fixed_spawn_theta_deg > -1000.0:
+                preferred_yaw = math.radians(self.fixed_spawn_theta_deg)
+            else:
+                preferred_yaw = random.random() * 2.0 * math.pi
+
+        if self.prefer_friend_front:
+            half_cone = max(0.0, math.radians(float(self.spawn_front_cone_deg)) * 0.5)
+            if half_cone > 1e-6:
+                deltas = np.linspace(-half_cone, half_cone, n, dtype=np.float32)
+                # Evaluate straight-ahead first for front_best; random_feasible will sample
+                # uniformly from feasible candidates after the feasible set is built.
+                deltas = sorted([float(x) for x in deltas], key=lambda v: abs(v))
+                angles = [preferred_yaw + d for d in deltas]
+            else:
+                angles = [preferred_yaw]
+            if self.spawn_full_circle_fallback:
+                full = np.linspace(-math.pi, math.pi, n, endpoint=False, dtype=np.float32)
+                full = sorted([float(x) for x in full], key=lambda v: -math.cos(v))
+                angles.extend([preferred_yaw + d for d in full])
+            return angles
+
+        if self.fixed_spawn_theta_deg > -1000.0:
+            return [math.radians(self.fixed_spawn_theta_deg)]
+        # No front preference: cover the full ring and let the selected mode choose.
+        return [float(x) for x in np.linspace(-math.pi, math.pi, n, endpoint=False, dtype=np.float32)]
+
+    def _sample_arena_constrained_spawn_center_xy(self) -> Optional[np.ndarray]:
+        """Sample target-cluster center in a fixed world-frame arena.
+
+        The center C satisfies, when feasible:
+            ||C - goal_xy|| == enemy_cluster_ring_radius
+            ||C - arena_center_xy|| <= effective_arena_radius
+
+        Selection behavior:
+            spawn_selection_mode=front_best      -> choose the feasible point most aligned with friend yaw.
+            spawn_selection_mode=random_feasible -> randomly choose from feasible points.
+
+        The current friend yaw is only used as a preference/source direction; the arena
+        center remains fixed in the world/map frame across node restarts.
+        """
+        goal_xy = self.goal_xyz[:2].astype(np.float32)
+        preferred_yaw = self._get_friend_spawn_yaw()
+        candidates = self._angle_candidates(preferred_yaw)
+
+        heading = None
+        if preferred_yaw is not None:
+            heading = np.array([math.cos(preferred_yaw), math.sin(preferred_yaw)], dtype=np.float32)
+
+        selected_center = None
+        selected_score = -float("inf")
+        selected_radius = None
+        selected_from_count = 0
+
+        random_mode = self.spawn_selection_mode in ("random", "random_feasible")
+
+        # Radius candidates are ordered from nominal radius down to min radius.
+        # We only shrink to a smaller radius if no feasible point exists at the larger one.
+        for radius in self._radius_candidates():
+            feasible = []
+            for theta in candidates:
+                direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
+                center = goal_xy + float(radius) * direction
+                if not self._xy_inside_effective_arena(center):
+                    continue
+
+                if heading is not None:
+                    score = float(np.dot(direction, heading))
+                else:
+                    score = 1.0
+                score = score + 1e-3 * float(radius)
+                feasible.append((center.astype(np.float32), score, float(radius)))
+
+            if not feasible:
+                continue
+
+            selected_from_count = len(feasible)
+            if random_mode:
+                selected_center, selected_score, selected_radius = random.choice(feasible)
+            else:
+                selected_center, selected_score, selected_radius = max(feasible, key=lambda x: x[1])
+            break
+
+        if selected_center is None:
+            return None
+
+        actual_r = float(np.linalg.norm(selected_center - goal_xy))
+        rospy.loginfo(
+            "arena_constrained spawn center=(%.3f, %.3f), mode=%s, feasible_candidates=%d, goal_xy=(%.3f, %.3f), dist_to_goal=%.3f, dist_to_arena_center=%.3f, effective_arena_radius=%.3f",
+            float(selected_center[0]),
+            float(selected_center[1]),
+            self.spawn_selection_mode,
+            int(selected_from_count),
+            float(goal_xy[0]),
+            float(goal_xy[1]),
+            actual_r,
+            float(np.linalg.norm(selected_center - self.arena_center_xy)),
+            self._effective_arena_radius(),
+        )
+        return selected_center.astype(np.float32)
+
+    def _sample_spawn_center_xy(self) -> Optional[np.ndarray]:
+        if self.spawn_center_xy is not None:
+            if self.spawn_center_xy.shape[0] != 2:
+                raise ValueError("~spawn_center_xy must have exactly 2 elements: [x, y]")
+            center = self.spawn_center_xy.astype(np.float32)
+            if self.spawn_mode in ("arena_constrained", "arena", "arena_front") and not self._xy_inside_effective_arena(center):
+                rospy.logwarn(
+                    "Explicit spawn_center_xy=%s is outside the effective arena radius %.3f around %s",
+                    center.tolist(),
+                    self._effective_arena_radius(),
+                    self.arena_center_xy.tolist(),
+                )
+            return center
+
+        if self.spawn_mode in ("arena_constrained", "arena", "arena_front"):
+            return self._sample_arena_constrained_spawn_center_xy()
+
+        # Legacy behavior: fixed_spawn_theta_deg is a world-frame angle.
+        if self.fixed_spawn_theta_deg > -1000.0:
+            theta = math.radians(self.fixed_spawn_theta_deg)
+        else:
+            theta = random.random() * 2.0 * math.pi
+        center_xy = self.goal_xyz[:2] + self.enemy_cluster_ring_radius * np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
+        return center_xy.astype(np.float32)
+
+    def _generate_local_template(self, count: int) -> np.ndarray:
+        if count <= 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        spacing = self.enemy_min_separation_min + random.random() * max(self.enemy_min_separation_max - self.enemy_min_separation_min, 0.0)
+        formation = self.formation_type
+        if formation == "random":
+            formation = random.choice(self.available_formations)
+
+        if formation == "line2d":
+            return self._tmpl_line2d(count, spacing)
+        if formation == "circle2d":
+            return self._tmpl_circle2d(count, spacing)
+        if formation == "v_wedge_2d":
+            return self._tmpl_v_wedge2d(count, spacing)
+        if formation == "rect2d":
+            return self._tmpl_rect2d(count, spacing)
+        if formation == "echelon_2d":
+            return self._tmpl_echelon2d(count, spacing)
+        if formation == "random_disk":
+            return self._tmpl_random_disk(count, spacing)
+
+        rospy.logwarn("Unknown formation_type=%s, fallback to random_disk", formation)
+        return self._tmpl_random_disk(count, spacing)
+
+    @staticmethod
+    def _centerize(xyz: np.ndarray) -> np.ndarray:
+        if xyz.size == 0:
+            return xyz.astype(np.float32)
+        return (xyz - xyz.mean(axis=0, keepdims=True)).astype(np.float32)
+
+    def _tmpl_line2d(self, count: int, spacing: float) -> np.ndarray:
+        t = (np.arange(count, dtype=np.float32) - (count - 1) / 2.0) * spacing
+        pts = np.stack([np.zeros_like(t), t, np.zeros_like(t)], axis=-1)
+        return self._centerize(pts)
+
+    def _tmpl_echelon2d(self, count: int, spacing: float) -> np.ndarray:
+        t = np.arange(count, dtype=np.float32)
+        pts = np.stack([t * spacing, t * spacing, np.zeros_like(t)], axis=-1)
+        return self._centerize(pts)
+
+    def _tmpl_circle2d(self, count: int, spacing: float) -> np.ndarray:
+        if count == 1:
+            return np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        radius = spacing / (2.0 * max(math.sin(math.pi / count), 1e-6))
+        ang = np.linspace(0.0, 2.0 * math.pi, num=count, endpoint=False, dtype=np.float32)
+        pts = np.stack([radius * np.cos(ang), radius * np.sin(ang), np.zeros_like(ang)], axis=-1)
+        return self._centerize(pts)
+
+    def _tmpl_v_wedge2d(self, count: int, spacing: float) -> np.ndarray:
+        if count == 1:
+            return np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        step = spacing / math.sqrt(2.0)
+        pts = [[0.0, 0.0, 0.0]]
+        k = 1
+        while len(pts) < count:
+            pts.append([k * step, k * step, 0.0])
+            if len(pts) < count:
+                pts.append([k * step, -k * step, 0.0])
+            k += 1
+        return self._centerize(np.asarray(pts[:count], dtype=np.float32))
+
+    def _tmpl_rect2d(self, count: int, spacing: float) -> np.ndarray:
+        cols = max(1, int(math.ceil(math.sqrt(2.0 * count))))
+        rows = int(math.ceil(count / cols))
+        pts = []
+        for r in range(rows):
+            for c in range(cols):
+                if len(pts) >= count:
+                    break
+                pts.append([float(c) * spacing, float(r) * spacing, 0.0])
+        return self._centerize(np.asarray(pts, dtype=np.float32))
+
+    def _tmpl_random_disk(self, count: int, spacing: float) -> np.ndarray:
+        pts: List[np.ndarray] = []
+        radius = max(self.enemy_cluster_radius, 0.5 * spacing * math.sqrt(max(count, 1)))
+        tries = 0
+        while len(pts) < count and tries < 5000:
+            tries += 1
+            rho = radius * math.sqrt(random.random())
+            theta = 2.0 * math.pi * random.random()
+            cand = np.array([rho * math.cos(theta), rho * math.sin(theta), 0.0], dtype=np.float32)
+            if all(np.linalg.norm(cand[:2] - p[:2]) >= spacing for p in pts):
+                pts.append(cand)
+        if len(pts) < count:
+            # fallback to line if packing failed
+            return self._tmpl_line2d(count, spacing)
+        return self._centerize(np.asarray(pts, dtype=np.float32))
+
+    # ------------------------------------------------------------------
+    # enemy dynamics (mirrors env high-level logic)
+    # ------------------------------------------------------------------
+    def _enemy_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        pos = np.stack([e.pos for e in self.enemies], axis=0).astype(np.float32)
+        vel = np.stack([e.vel for e in self.enemies], axis=0).astype(np.float32)
+        frozen = np.asarray([e.frozen or (not e.exists) for e in self.enemies], dtype=bool)
+        return pos, vel, frozen
+
+    def _friend_pos_array(self) -> np.ndarray:
+        """Return friendly UAV positions used as pursuer-repulsion sources.
+
+        Keep frozen / hit friendly UAVs in this list. This matches the RL env
+        force-field behavior: after a friendly UAV hits a target and hovers at
+        the capture point, it still occupies space and should still repel active
+        enemies. Missing odometry is still ignored because its position is unknown.
+        """
+        repulsion_sources = []
+        for _i, st in enumerate(self.friend_states):
+            if not st.received:
+                continue
+            if not np.isfinite(st.pos).all():
+                continue
+            repulsion_sources.append(st.pos.astype(np.float32))
+        if not repulsion_sources:
+            return np.zeros((0, 3), dtype=np.float32)
+        return np.stack(repulsion_sources, axis=0)
+
+    def _active_enemy_centroid_and_axis(self, en_pos: np.ndarray, enemy_frozen: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        active_mask = ~enemy_frozen
+        if np.any(active_mask):
+            centroid = en_pos[active_mask].mean(axis=0)
+        else:
+            centroid = en_pos.mean(axis=0) if en_pos.size else self.goal_xyz.copy()
+        axis = centroid - self.goal_xyz
+        axis_xy = axis[:2]
+        n = np.linalg.norm(axis_xy)
+        if n < 1e-6:
+            axis_hat_xy = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            axis_hat_xy = (axis_xy / n).astype(np.float32)
+        return centroid.astype(np.float32), axis_hat_xy
+
+    def compute_enemy_velocity_step(self) -> np.ndarray:
+        en_pos, _, enemy_frozen = self._enemy_arrays()
+        E = en_pos.shape[0]
+        if E == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        speed = self.enemy_speed
+        eps = self.enemy_evasive_eps
+        goal_xy = self.goal_xyz[:2].astype(np.float32)
+        _, axis_hat_xy = self._active_enemy_centroid_and_axis(en_pos, enemy_frozen)
+
+        to_goal_xy = goal_xy[None, :] - en_pos[:, :2]
+        to_goal_norm = np.linalg.norm(to_goal_xy, axis=-1, keepdims=True)
+        fallback_dir_xy = -np.repeat(axis_hat_xy[None, :], E, axis=0)
+        goal_dir_xy = np.where(
+            to_goal_norm > eps,
+            to_goal_xy / np.maximum(to_goal_norm, eps),
+            fallback_dir_xy,
+        ).astype(np.float32)
+
+        if self.enemy_motion_mode == "translate":
+            v_xy = goal_dir_xy * speed
+        else:
+            goal_force = goal_dir_xy * self.enemy_goal_attraction_weight
+
+            pursuer_force = np.zeros((E, 2), dtype=np.float32)
+            friend_pos = self._friend_pos_array()
+            if friend_pos.shape[0] > 0:
+                enemy_xy = en_pos[:, :2][:, None, :]    # [E,1,2]
+                friend_xy = friend_pos[:, :2][None, :, :]  # [1,M,2]
+                enemy_to_friend = friend_xy - enemy_xy     # [E,M,2]
+                d = np.linalg.norm(enemy_to_friend, axis=-1)  # [E,M]
+                gate = 1.0 / (1.0 + np.exp(-(self.enemy_pursuer_repulsion_range - d) / max(self.enemy_pursuer_repulsion_smooth, 1e-6)))
+                inv_d2 = 1.0 / np.maximum(d, eps) ** 2
+                inv_r2 = 1.0 / (self.enemy_pursuer_repulsion_range ** 2)
+                strength = self.enemy_pursuer_repulsion_weight * gate * np.maximum(inv_d2 - inv_r2, 0.0)
+                strength = np.minimum(strength, self.enemy_pursuer_repulsion_max)
+                repulsion_dir = -enemy_to_friend / np.maximum(d[..., None], eps)
+                pursuer_force = np.sum(repulsion_dir * strength[..., None], axis=1)
+
+            separation_force = np.zeros((E, 2), dtype=np.float32)
+            cohesion_force = np.zeros((E, 2), dtype=np.float32)
+            if E > 1:
+                enemy_alive = ~enemy_frozen
+                for i in range(E):
+                    if enemy_frozen[i]:
+                        continue
+                    neigh = []
+                    for j in range(E):
+                        if i == j or enemy_frozen[j]:
+                            continue
+                        diff = en_pos[j, :2] - en_pos[i, :2]
+                        dij = np.linalg.norm(diff)
+                        if dij < self.enemy_separation_range:
+                            separation_force[i] += (-diff / max(dij, eps)) * (self.enemy_separation_weight / max(dij, eps) ** 2)
+                        if dij < self.enemy_cohesion_range:
+                            neigh.append(en_pos[j, :2])
+                    if neigh:
+                        center = np.mean(np.asarray(neigh, dtype=np.float32), axis=0)
+                        to_center = center - en_pos[i, :2]
+                        nc = np.linalg.norm(to_center)
+                        if nc > eps:
+                            cohesion_force[i] = (to_center / nc) * self.enemy_cohesion_weight
+
+            total_force = goal_force + pursuer_force + separation_force + cohesion_force
+            total_norm = np.linalg.norm(total_force, axis=-1, keepdims=True)
+            v_xy = np.where(total_norm > eps, total_force / np.maximum(total_norm, eps) * speed, goal_dir_xy * speed).astype(np.float32)
+
+        out = np.zeros((E, 3), dtype=np.float32)
+        out[:, :2] = v_xy
+        out[enemy_frozen] = 0.0
+        return out
+
+    # ------------------------------------------------------------------
+    # timer / step / hit handling
+    # ------------------------------------------------------------------
+    def _timer_cb(self, _event) -> None:
+        now = rospy.Time.now()
+        if self._spawn_pending:
+            self.spawn_enemies()
+            if self._spawn_pending:
+                self.publish_enemy_masks(force=False)
+                return
+        if not self._check_and_release_motion(now):
+            self.publish_enemy_masks(force=False)
+            return
+        if self._episode_terminated and self.stop_publish_after_terminate:
+            return
+        if self._last_time is None:
+            self._last_time = now
+            self.publish_enemy_masks(force=False)
+            self.publish_all_odometry(now)
+            if self.publish_markers:
+                self.publish_marker_array(now)
+            return
+
+        dt = max((now - self._last_time).to_sec(), 1e-4)
+        self._last_time = now
+
+        self.step_dynamics(dt)
+        self.publish_enemy_masks(force=False)
+        self.publish_all_odometry(now)
+        if self.publish_markers:
+            self.publish_marker_array(now)
+
+    def step_dynamics(self, dt: float) -> None:
+        if self._episode_terminated:
+            return
+        v_step = self.compute_enemy_velocity_step()
+        any_reached_goal = False
+
+        for i, enemy in enumerate(self.enemies):
+            if (not enemy.exists) or enemy.frozen:
+                enemy.vel = np.zeros(3, dtype=np.float32)
+                continue
+            enemy.vel = v_step[i].copy()
+            enemy.pos = enemy.pos + enemy.vel * float(dt)
+            self._append_trail(i, enemy.pos)
+
+            if np.linalg.norm(enemy.pos[:2] - self.goal_xyz[:2]) <= self.enemy_goal_radius:
+                any_reached_goal = True
+                if self.freeze_when_reach_goal:
+                    self._freeze_enemy(i, reason="reach_goal")
+
+        if any_reached_goal:
+            if self.terminate_on_goal_reach:
+                self._terminate_episode("goal_reached")
+                return
+            rospy.logwarn_throttle(1.0, "At least one enemy has reached the goal region")
+
+    def _append_trail(self, enemy_idx: int, pos: np.ndarray) -> None:
+        if not self.show_trails:
+            return
+        trail = self._enemy_trails[enemy_idx]
+        trail.append(pos.copy())
+        if len(trail) > self.trail_length:
+            del trail[0:len(trail) - self.trail_length]
+
+    def _freeze_enemy(self, enemy_idx: int, reason: str = "") -> None:
+        if not (0 <= enemy_idx < self.enemy_size):
+            return
+        enemy = self.enemies[enemy_idx]
+        if not enemy.exists:
+            return
+        if enemy.frozen:
+            return
+        enemy.frozen = True
+        enemy.vel = np.zeros(3, dtype=np.float32)
+        if not self.keep_exists_true_when_hit:
+            enemy.exists = False
+        rospy.loginfo("Enemy %d frozen (%s)", enemy_idx, reason)
+        self.publish_enemy_masks(force=True)
+
+    def _terminate_episode(self, reason: str) -> None:
+        if self._episode_terminated:
+            return
+        self._episode_terminated = True
+        self._termination_reason = str(reason)
+        self._termination_stamp = rospy.Time.now()
+        for enemy in self.enemies:
+            enemy.vel = np.zeros(3, dtype=np.float32)
+        self.publish_enemy_masks(force=True)
+        self.publish_termination_status()
+        if self.clear_markers_on_terminate and self.publish_markers and not self._markers_cleared_after_terminate:
+            ma = MarkerArray()
+            ma.markers.extend(self._delete_all_markers())
+            self.marker_pub.publish(ma)
+            arena_ma = MarkerArray()
+            arena_ma.markers.extend(self._delete_marker_namespaces(["arena_circle"]))
+            self.arena_marker_pub.publish(arena_ma)
+            spawn_ma = MarkerArray()
+            spawn_ma.markers.extend(self._delete_marker_namespaces(["spawn_distance_ring", "spawn_vector"]))
+            self.spawn_constraint_marker_pub.publish(spawn_ma)
+            self._markers_cleared_after_terminate = True
+        rospy.logwarn("Enemy episode terminated: %s", self._termination_reason)
+
+    def publish_termination_status(self) -> None:
+        self.episode_terminated_pub.publish(Bool(data=bool(self._episode_terminated)))
+        self.termination_reason_pub.publish(String(data=self._termination_reason))
+
+    # ------------------------------------------------------------------
+    # publishing
+    # ------------------------------------------------------------------
+    def publish_enemy_masks(self, force: bool = False) -> None:
+        if not self._motion_released:
+            exists = UInt8MultiArray(data=[0 for _ in self.enemies])
+            frozen = UInt8MultiArray(data=[0 for _ in self.enemies])
+            alive = UInt8MultiArray(data=[0 for _ in self.enemies])
+        else:
+            exists = UInt8MultiArray(data=[1 if e.exists else 0 for e in self.enemies])
+            frozen = UInt8MultiArray(data=[1 if (e.frozen and e.exists) else 0 for e in self.enemies])
+            alive = UInt8MultiArray(data=[1 if (e.exists and not e.frozen) else 0 for e in self.enemies])
+        self.enemy_exists_pub.publish(exists)
+        self.enemy_frozen_pub.publish(frozen)
+        self.enemy_alive_pub.publish(alive)
+
+    def publish_all_odometry(self, stamp: rospy.Time) -> None:
+        if not self._motion_released:
+            return
+        for i, pub in enumerate(self.enemy_pubs):
+            if not self.enemies[i].exists or self.enemies[i].frozen:
+                continue
+            pub.publish(self._build_enemy_odom(i, stamp))
+
+    def _build_enemy_odom(self, enemy_idx: int, stamp: rospy.Time) -> Odometry:
+        enemy = self.enemies[enemy_idx]
+        msg = Odometry()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.frame_id
+        msg.child_frame_id = f"enemy_{enemy_idx}"
+
+        if enemy.exists:
+            msg.pose.pose.position.x = float(enemy.pos[0])
+            msg.pose.pose.position.y = float(enemy.pos[1])
+            msg.pose.pose.position.z = float(enemy.pos[2])
+            yaw = math.atan2(float(enemy.vel[1]), float(enemy.vel[0])) if np.linalg.norm(enemy.vel[:2]) > 1e-6 else 0.0
+            q = self._yaw_to_quat_xyzw(yaw)
+            msg.pose.pose.orientation = q
+            msg.twist.twist.linear.x = float(enemy.vel[0])
+            msg.twist.twist.linear.y = float(enemy.vel[1])
+            msg.twist.twist.linear.z = float(enemy.vel[2])
+        return msg
+
+    @staticmethod
+    def _yaw_to_quat_xyzw(yaw: float) -> Quaternion:
+        half = 0.5 * yaw
+        return Quaternion(x=0.0, y=0.0, z=math.sin(half), w=math.cos(half))
+
+    def _build_circle_marker(self, ns: str, marker_id: int, center_xy: np.ndarray, radius: float, z: float, line_width: float, rgba: Tuple[float, float, float, float]) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = float(line_width)
+        marker.color.r = float(rgba[0])
+        marker.color.g = float(rgba[1])
+        marker.color.b = float(rgba[2])
+        marker.color.a = float(rgba[3])
+        n = max(12, int(self.arena_marker_points))
+        r = max(0.0, float(radius))
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+        for k in range(n + 1):
+            th = 2.0 * math.pi * float(k) / float(n)
+            marker.points.append(Point(x=cx + r * math.cos(th), y=cy + r * math.sin(th), z=float(z)))
+        return marker
+
+    def _build_spawn_vector_marker(self, stamp: rospy.Time) -> Marker:
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = stamp
+        marker.ns = "spawn_vector"
+        marker.id = 0
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        p0 = Point(x=float(self.goal_xyz[0]), y=float(self.goal_xyz[1]), z=float(self.goal_xyz[2]))
+        p1 = Point(x=float(self._spawn_center_xy[0]), y=float(self._spawn_center_xy[1]), z=float(self.goal_xyz[2]))
+        marker.points = [p0, p1]
+        marker.scale.x = 0.035
+        marker.scale.y = 0.10
+        marker.scale.z = 0.15
+        marker.color.r = 1.0
+        marker.color.g = 0.5
+        marker.color.b = 0.0
+        marker.color.a = 0.9
+        return marker
+
+    def _delete_marker_namespaces(self, namespaces: Sequence[str]) -> List[Marker]:
+        out = []
+        for ns in namespaces:
+            m = Marker()
+            m.header.frame_id = self.frame_id
+            m.ns = ns
+            m.action = Marker.DELETEALL
+            out.append(m)
+        return out
+
+    def publish_arena_marker_array(self, stamp: rospy.Time) -> None:
+        ma = MarkerArray()
+        ma.markers.extend(self._delete_marker_namespaces(["arena_circle"]))
+        if self.publish_arena_marker:
+            marker = self._build_circle_marker(
+                ns="arena_circle",
+                marker_id=0,
+                center_xy=self.arena_center_xy,
+                radius=self._effective_arena_radius(),
+                z=self.arena_marker_z,
+                line_width=self.arena_marker_line_width,
+                rgba=(0.2, 0.9, 1.0, 0.9),
+            )
+            marker.header.stamp = stamp
+            ma.markers.append(marker)
+        self.arena_marker_pub.publish(ma)
+
+    def publish_spawn_constraint_marker_array(self, stamp: rospy.Time) -> None:
+        ma = MarkerArray()
+        ma.markers.extend(self._delete_marker_namespaces(["spawn_distance_ring", "spawn_vector"]))
+        if self.publish_spawn_constraint_marker:
+            marker = self._build_circle_marker(
+                ns="spawn_distance_ring",
+                marker_id=0,
+                center_xy=self.goal_xyz[:2],
+                radius=float(self.enemy_cluster_ring_radius),
+                z=float(self.goal_xyz[2]),
+                line_width=self.spawn_ring_marker_line_width,
+                rgba=(1.0, 1.0, 0.2, 0.7),
+            )
+            marker.header.stamp = stamp
+            ma.markers.append(marker)
+            if self._spawn_center_xy is not None:
+                ma.markers.append(self._build_spawn_vector_marker(stamp))
+        self.spawn_constraint_marker_pub.publish(ma)
+
+    def publish_marker_array(self, stamp: rospy.Time) -> None:
+        ma = MarkerArray()
+        ma.markers.extend(self._delete_all_markers())
+
+        # goal marker
+        goal_marker = Marker()
+        goal_marker.header.frame_id = self.frame_id
+        goal_marker.header.stamp = stamp
+        goal_marker.ns = "goal"
+        goal_marker.id = 0
+        goal_marker.type = Marker.SPHERE
+        goal_marker.action = Marker.ADD
+        goal_marker.pose.position.x = float(self.goal_xyz[0])
+        goal_marker.pose.position.y = float(self.goal_xyz[1])
+        goal_marker.pose.position.z = float(self.goal_xyz[2])
+        goal_marker.pose.orientation.w = 1.0
+        goal_marker.scale = Vector3(self.goal_marker_scale, self.goal_marker_scale, self.goal_marker_scale)
+        goal_marker.color.r = 0.1
+        goal_marker.color.g = 1.0
+        goal_marker.color.b = 0.1
+        goal_marker.color.a = 0.9
+        ma.markers.append(goal_marker)
+
+        # Arena/spawn constraint circles are published on separate topics so RViz can
+        # subscribe/toggle them independently. The main marker topic keeps only goal,
+        # enemy body/text/velocity/trail, and centroid markers.
+
+        # centroid marker
+        pos, _, frozen = self._enemy_arrays()
+        if pos.size:
+            active_mask = ~frozen
+            centroid = pos[active_mask].mean(axis=0) if np.any(active_mask) else pos.mean(axis=0)
+            centroid_marker = Marker()
+            centroid_marker.header.frame_id = self.frame_id
+            centroid_marker.header.stamp = stamp
+            centroid_marker.ns = "centroid"
+            centroid_marker.id = 0
+            centroid_marker.type = Marker.SPHERE
+            centroid_marker.action = Marker.ADD
+            centroid_marker.pose.position.x = float(centroid[0])
+            centroid_marker.pose.position.y = float(centroid[1])
+            centroid_marker.pose.position.z = float(centroid[2])
+            centroid_marker.pose.orientation.w = 1.0
+            centroid_marker.scale = Vector3(0.18, 0.18, 0.18)
+            centroid_marker.color.r = 1.0
+            centroid_marker.color.g = 1.0
+            centroid_marker.color.b = 0.0
+            centroid_marker.color.a = 0.9
+            ma.markers.append(centroid_marker)
+
+        for i, enemy in enumerate(self.enemies):
+            if not enemy.exists:
+                continue
+
+            # body sphere
+            m = Marker()
+            m.header.frame_id = self.frame_id
+            m.header.stamp = stamp
+            m.ns = "enemy_body"
+            m.id = i
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(enemy.pos[0])
+            m.pose.position.y = float(enemy.pos[1])
+            m.pose.position.z = float(enemy.pos[2])
+            m.pose.orientation.w = 1.0
+            m.scale = Vector3(self.enemy_marker_scale, self.enemy_marker_scale, self.enemy_marker_scale)
+            if enemy.frozen:
+                m.color.r, m.color.g, m.color.b, m.color.a = (0.5, 0.5, 0.5, 0.9)
+            else:
+                m.color.r, m.color.g, m.color.b, m.color.a = (1.0, 0.2, 0.2, 0.9)
+            ma.markers.append(m)
+
+            # text label
+            if self.show_text:
+                t = Marker()
+                t.header.frame_id = self.frame_id
+                t.header.stamp = stamp
+                t.ns = "enemy_text"
+                t.id = i
+                t.type = Marker.TEXT_VIEW_FACING
+                t.action = Marker.ADD
+                t.pose.position.x = float(enemy.pos[0])
+                t.pose.position.y = float(enemy.pos[1])
+                t.pose.position.z = float(enemy.pos[2] + 0.35)
+                t.pose.orientation.w = 1.0
+                t.scale.z = 0.18
+                t.color.r = 1.0
+                t.color.g = 1.0
+                t.color.b = 1.0
+                t.color.a = 1.0
+                speed = float(np.linalg.norm(enemy.vel[:2]))
+                status = "FROZEN" if enemy.frozen else "ACTIVE"
+                t.text = f"E{i} {status} v={speed:.2f}"
+                ma.markers.append(t)
+
+            # velocity arrow
+            if self.show_velocity_arrows:
+                a = Marker()
+                a.header.frame_id = self.frame_id
+                a.header.stamp = stamp
+                a.ns = "enemy_vel"
+                a.id = i
+                a.type = Marker.ARROW
+                a.action = Marker.ADD
+                p0 = Point(x=float(enemy.pos[0]), y=float(enemy.pos[1]), z=float(enemy.pos[2]))
+                p1 = Point(x=float(enemy.pos[0] + enemy.vel[0]), y=float(enemy.pos[1] + enemy.vel[1]), z=float(enemy.pos[2] + enemy.vel[2]))
+                a.points = [p0, p1]
+                a.scale.x = self.arrow_shaft_d
+                a.scale.y = self.arrow_head_d
+                a.scale.z = self.arrow_head_l
+                a.color.r = 0.2
+                a.color.g = 0.8
+                a.color.b = 1.0
+                a.color.a = 0.9
+                ma.markers.append(a)
+
+            # trail
+            if self.show_trails and self._enemy_trails[i]:
+                tr = Marker()
+                tr.header.frame_id = self.frame_id
+                tr.header.stamp = stamp
+                tr.ns = "enemy_trail"
+                tr.id = i
+                tr.type = Marker.LINE_STRIP
+                tr.action = Marker.ADD
+                tr.scale.x = 0.03
+                tr.color.r = 1.0
+                tr.color.g = 0.5
+                tr.color.b = 0.0
+                tr.color.a = 0.9
+                tr.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in self._enemy_trails[i]]
+                ma.markers.append(tr)
+
+        self.marker_pub.publish(ma)
+        self.publish_arena_marker_array(stamp)
+        self.publish_spawn_constraint_marker_array(stamp)
+
+    def _delete_all_markers(self) -> List[Marker]:
+        out = []
+        for ns in ["goal", "centroid", "enemy_body", "enemy_text", "enemy_vel", "enemy_trail", "arena_circle", "spawn_distance_ring", "spawn_vector"]:
+            m = Marker()
+            m.header.frame_id = self.frame_id
+            m.ns = ns
+            m.action = Marker.DELETEALL
+            out.append(m)
+        return out
+
+
+def main() -> None:
+    rospy.init_node("enemy_target_manager")
+    EnemyTargetManager()
+    rospy.spin()
+
+
+if __name__ == "__main__":
+    main()

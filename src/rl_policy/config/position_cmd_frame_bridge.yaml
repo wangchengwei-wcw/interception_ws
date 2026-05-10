@@ -1,0 +1,37 @@
+position_cmd_frame_bridge:
+  num_uavs: 3
+  transform_mode: world_to_local
+
+  input_cmd_topics:
+    - /uav0/position_cmd_world
+    - /uav1/position_cmd_world
+    - /uav2/position_cmd_world
+
+  output_cmd_topics:
+    - /uav0/position_cmd
+    - /uav1/position_cmd
+    - /uav2/position_cmd
+
+  input_frame_id: world
+  output_frame_ids:
+    - uav0/fastlio_world
+    - uav1/fastlio_world
+    - uav2/fastlio_world
+
+  # Must be exactly the same as odom_bridge.world_xyz_offsets
+  world_xyz_offsets:
+    - [0.0,  0.0, 0.0]
+    - [0.0, -1.0, 0.0]
+    - [0.0,  1.0, 0.0]
+
+  # Must be exactly the same as odom_bridge.world_yaw_offsets_deg
+  world_yaw_offsets_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+
+  warn_on_frame_mismatch: true
+  allow_empty_input_frame: true
+  drop_on_frame_mismatch: false
+  debug_first_n: 5
+  fail_if_all_offsets_zero: false
